@@ -32,6 +32,8 @@ export async function syncSessionFiles(params: {
   ftsAvailable: boolean;
   model: string;
   dirtyFiles: Set<string>;
+  onUnchanged?: (entry: SessionFileEntry, absPath: string) => void;
+  onIndexed?: (entry: SessionFileEntry, absPath: string) => void;
 }) {
   const files = await listSessionFilesForAgent(params.agentId);
   const activePaths = new Set(files.map((file) => sessionPathForFile(file)));
@@ -80,6 +82,7 @@ export async function syncSessionFiles(params: {
       .prepare(`SELECT hash FROM files WHERE path = ? AND source = ?`)
       .get(entry.path, "sessions") as { hash: string } | undefined;
     if (!params.needsFullReindex && record?.hash === entry.hash) {
+      params.onUnchanged?.(entry, absPath);
       if (params.progress) {
         params.progress.completed += 1;
         params.progress.report({
@@ -90,6 +93,7 @@ export async function syncSessionFiles(params: {
       return;
     }
     await params.indexFile(entry);
+    params.onIndexed?.(entry, absPath);
     if (params.progress) {
       params.progress.completed += 1;
       params.progress.report({
