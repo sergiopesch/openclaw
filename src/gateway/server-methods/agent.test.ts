@@ -214,4 +214,98 @@ describe("gateway agent handler", () => {
     expect(capturedEntry?.cliSessionIds).toBeUndefined();
     expect(capturedEntry?.claudeCliSessionId).toBeUndefined();
   });
+
+  it("keeps webchat agent runs internal when no external reply channel is specified", async () => {
+    mocks.loadSessionEntry.mockReturnValue({
+      cfg: {},
+      storePath: "/tmp/sessions.json",
+      entry: {
+        sessionId: "existing-session-id",
+        updatedAt: Date.now(),
+      },
+      canonicalKey: "agent:main:tui-test",
+    });
+    mocks.updateSessionStore.mockResolvedValue(undefined);
+    mocks.agentCommand.mockResolvedValue({
+      payloads: [{ text: "ok" }],
+      meta: { durationMs: 100 },
+    });
+
+    const respond = vi.fn();
+    await agentHandlers.agent({
+      params: {
+        message: "test internal webchat run",
+        agentId: "main",
+        sessionKey: "agent:main:tui-test",
+        idempotencyKey: "test-webchat-internal",
+        deliver: true,
+      },
+      respond,
+      context: makeContext(),
+      req: { type: "req", id: "3", method: "agent" },
+      client: {
+        connect: {
+          client: {
+            id: "webchat-ui",
+            mode: "webchat",
+            version: "test",
+            platform: "linux",
+          },
+        },
+      } as any,
+      isWebchatConnect: () => true,
+    });
+
+    await vi.waitFor(() => expect(mocks.agentCommand).toHaveBeenCalled());
+    const callArgs = mocks.agentCommand.mock.calls.at(-1)?.[0];
+    expect(callArgs.channel).toBe("webchat");
+    expect(callArgs.deliver).toBe(false);
+  });
+
+  it("keeps ui agent runs internal when no external reply channel is specified", async () => {
+    mocks.loadSessionEntry.mockReturnValue({
+      cfg: {},
+      storePath: "/tmp/sessions.json",
+      entry: {
+        sessionId: "existing-session-id",
+        updatedAt: Date.now(),
+      },
+      canonicalKey: "agent:main:tui-test",
+    });
+    mocks.updateSessionStore.mockResolvedValue(undefined);
+    mocks.agentCommand.mockResolvedValue({
+      payloads: [{ text: "ok" }],
+      meta: { durationMs: 100 },
+    });
+
+    const respond = vi.fn();
+    await agentHandlers.agent({
+      params: {
+        message: "test internal ui run",
+        agentId: "main",
+        sessionKey: "agent:main:tui-test",
+        idempotencyKey: "test-ui-internal",
+        deliver: true,
+      },
+      respond,
+      context: makeContext(),
+      req: { type: "req", id: "4", method: "agent" },
+      client: {
+        connect: {
+          client: {
+            id: "gateway-client",
+            mode: "ui",
+            version: "test",
+            platform: "linux",
+          },
+        },
+      } as any,
+      isWebchatConnect: () => false,
+    });
+
+    await vi.waitFor(() => expect(mocks.agentCommand).toHaveBeenCalled());
+    const callArgs = mocks.agentCommand.mock.calls.at(-1)?.[0];
+    expect(callArgs.channel).toBe("webchat");
+    expect(callArgs.deliver).toBe(false);
+  });
 });

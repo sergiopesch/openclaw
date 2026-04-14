@@ -74,6 +74,24 @@ type StatusArgs = {
   now?: number;
 };
 
+function isCodexOAuthAuthLabel(label?: string): boolean {
+  if (!label) {
+    return false;
+  }
+  const normalized = label.toLowerCase();
+  return normalized === "oauth" || normalized.startsWith("oauth ");
+}
+
+function formatStatusAuthLabel(provider: string, authLabelValue?: string): string | undefined {
+  if (!authLabelValue) {
+    return undefined;
+  }
+  if (provider === "openai-codex" && isCodexOAuthAuthLabel(authLabelValue)) {
+    return "Codex OAuth";
+  }
+  return authLabelValue;
+}
+
 function resolveRuntimeLabel(
   args: Pick<StatusArgs, "config" | "agent" | "sessionKey" | "sessionScope">,
 ): string {
@@ -435,17 +453,20 @@ export function buildStatusMessage(args: StatusArgs): string {
   const authMode = resolveModelAuthMode(provider, args.config);
   const authLabelValue =
     args.modelAuth ?? (authMode && authMode !== "unknown" ? authMode : undefined);
+  const isCodexOAuth = provider === "openai-codex" && isCodexOAuthAuthLabel(authLabelValue);
   const showCost = authLabelValue === "api-key" || authLabelValue === "mixed";
-  const costConfig = showCost
-    ? resolveModelCostConfig({
-        provider,
-        model,
-        config: args.config,
-      })
-    : undefined;
+  const showApiValue = isCodexOAuth;
+  const costConfig =
+    showCost || showApiValue
+      ? resolveModelCostConfig({
+          provider,
+          model,
+          config: args.config,
+        })
+      : undefined;
   const hasUsage = typeof inputTokens === "number" || typeof outputTokens === "number";
-  const cost =
-    showCost && hasUsage
+  const estimatedValue =
+    (showCost || showApiValue) && hasUsage
       ? estimateUsageCost({
           usage: {
             input: inputTokens ?? undefined,
@@ -454,17 +475,24 @@ export function buildStatusMessage(args: StatusArgs): string {
           cost: costConfig,
         })
       : undefined;
-  const costLabel = showCost && hasUsage ? formatUsd(cost) : undefined;
+  const costLabel = showCost && hasUsage ? formatUsd(estimatedValue) : undefined;
+  const apiValueLabel = showApiValue && hasUsage ? formatUsd(estimatedValue) : undefined;
 
   const modelLabel = model ? `${provider}/${model}` : "unknown";
-  const authLabel = authLabelValue ? ` · 🔑 ${authLabelValue}` : "";
+  const authStatusLabel = formatStatusAuthLabel(provider, authLabelValue);
+  const authLabel = authStatusLabel ? ` · 🔑 ${authStatusLabel}` : "";
   const modelLine = `🧠 Model: ${modelLabel}${authLabel}`;
   const commit = resolveCommitHash();
   const versionLine = `🦞 OpenClaw ${VERSION}${commit ? ` (${commit})` : ""}`;
   const usagePair = formatUsagePair(inputTokens, outputTokens);
-  const costLine = costLabel ? `💵 Cost: ${costLabel}` : null;
+  const financeParts = [
+    costLabel ? `💵 Cost: ${costLabel}` : null,
+    isCodexOAuth ? `💵 Cost: N/A` : null,
+    apiValueLabel ? `🧾 API value: ${apiValueLabel}` : null,
+  ].filter(Boolean) as string[];
+  const financeLine = financeParts.length > 0 ? financeParts.join(" · ") : null;
   const usageCostLine =
-    usagePair && costLine ? `${usagePair} · ${costLine}` : (usagePair ?? costLine);
+    usagePair && financeLine ? `${usagePair} · ${financeLine}` : (usagePair ?? financeLine);
   const mediaLine = formatMediaUnderstandingLine(args.mediaDecisions);
   const voiceLine = formatVoiceModeLine(args.config, args.sessionEntry);
 

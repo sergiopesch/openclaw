@@ -343,6 +343,44 @@ describe("buildStatusMessage", () => {
     });
 
     expect(text).not.toContain("💵 Cost:");
+    expect(text).not.toContain("API value:");
+  });
+
+  it("shows cost na plus api value for codex oauth", () => {
+    const text = buildStatusMessage({
+      config: {
+        models: {
+          providers: {
+            "openai-codex": {
+              models: [
+                {
+                  id: "gpt-5.4",
+                  cost: {
+                    input: 1,
+                    output: 2,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                  },
+                },
+              ],
+            },
+          },
+        },
+      } as OpenClawConfig,
+      agent: { model: "openai-codex/gpt-5.4" },
+      sessionEntry: { sessionId: "codex-1", updatedAt: 0, inputTokens: 1000, outputTokens: 500 },
+      sessionKey: "agent:main:main",
+      sessionScope: "per-sender",
+      queue: { mode: "collect", depth: 0 },
+      modelAuth: "oauth (openai-codex:default)",
+    });
+
+    const normalized = normalizeTestText(text);
+    expect(normalized).toContain("Model: openai-codex/gpt-5.4");
+    expect(normalized).toContain("Codex OAuth");
+    expect(normalized).toContain("Tokens: 1.0k in / 500 out");
+    expect(normalized).toContain("Cost: N/A");
+    expect(normalized).toContain("API value: $");
   });
 
   it("prefers cached prompt tokens from the session log", async () => {

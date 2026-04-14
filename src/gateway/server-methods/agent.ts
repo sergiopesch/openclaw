@@ -19,10 +19,12 @@ import { defaultRuntime } from "../../runtime.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { normalizeSessionDeliveryFields } from "../../utils/delivery-context.js";
 import {
+  GATEWAY_CLIENT_MODES,
   INTERNAL_MESSAGE_CHANNEL,
   isDeliverableMessageChannel,
   isGatewayMessageChannel,
   normalizeMessageChannel,
+  normalizeGatewayClientMode,
 } from "../../utils/message-channel.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import { parseMessageWithAttachments } from "../chat-attachments.js";
@@ -42,7 +44,7 @@ import { waitForAgentJob } from "./agent-job.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
 export const agentHandlers: GatewayRequestHandlers = {
-  agent: async ({ params, respond, context }) => {
+  agent: async ({ params, respond, context, client, isWebchatConnect }) => {
     const p = params;
     if (!validateAgentParams(p)) {
       respond(
@@ -308,9 +310,20 @@ export const agentHandlers: GatewayRequestHandlers = {
       typeof request.threadId === "string" && request.threadId.trim()
         ? request.threadId.trim()
         : undefined;
+    const clientMode = normalizeGatewayClientMode(client?.connect?.client?.mode);
+    const isInternalUiRun = Boolean(
+      client &&
+      (isWebchatConnect(client.connect) || clientMode === GATEWAY_CLIENT_MODES.UI) &&
+      !request.channel?.trim() &&
+      !request.replyChannel?.trim() &&
+      !explicitTo,
+    );
+
     const deliveryPlan = resolveAgentDeliveryPlan({
       sessionEntry,
-      requestedChannel: request.replyChannel ?? request.channel,
+      requestedChannel: isInternalUiRun
+        ? INTERNAL_MESSAGE_CHANNEL
+        : (request.replyChannel ?? request.channel),
       explicitTo,
       explicitThreadId,
       accountId: request.replyAccountId ?? request.accountId,

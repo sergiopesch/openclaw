@@ -50,24 +50,51 @@ function resolveSystemdUnitPath(env: Record<string, string | undefined>): string
   return resolveSystemdUnitPathForName(env, resolveSystemdServiceName(env));
 }
 
-export function resolveSystemdUserUnitPath(env: Record<string, string | undefined>): string {
-  return resolveSystemdUnitPath(env);
+type ParsedSystemdUnit = {
+  name: string;
+  unitPath: string;
+  execStart?: string;
+  workingDirectory?: string;
+  environment: Record<string, string>;
+  marker: boolean;
+  kindGateway: boolean;
+};
+
+function scoreParsedSystemdUnit(
+  unit: ParsedSystemdUnit,
+  env: Record<string, string | undefined>,
+  desiredName: string,
+): number {
+  let score = 0;
+  if (unit.name === desiredName) {
+    score += 100;
+  }
+  if (unit.marker && unit.kindGateway) {
+    score += 40;
+  } else if (unit.name.startsWith("openclaw-gateway")) {
+    score += 10;
+  }
+
+  const configPath = env.OPENCLAW_CONFIG_PATH?.trim();
+  const stateDir = env.OPENCLAW_STATE_DIR?.trim();
+  const profile = env.OPENCLAW_PROFILE?.trim();
+  if (configPath && unit.environment.OPENCLAW_CONFIG_PATH?.trim() === configPath) {
+    score += 80;
+  }
+  if (stateDir && unit.environment.OPENCLAW_STATE_DIR?.trim() === stateDir) {
+    score += 70;
+  }
+  if (profile && unit.environment.OPENCLAW_PROFILE?.trim() === profile) {
+    score += 30;
+  }
+  return score;
 }
 
-export { enableSystemdUserLinger, readSystemdUserLingerStatus };
-export type { SystemdUserLingerStatus };
-
-// Unit file parsing/rendering: see systemd-unit.ts
-
-export async function readSystemdServiceExecStart(
+async function readParsedSystemdUnit(
   env: Record<string, string | undefined>,
-): Promise<{
-  programArguments: string[];
-  workingDirectory?: string;
-  environment?: Record<string, string>;
-  sourcePath?: string;
-} | null> {
-  const unitPath = resolveSystemdUnitPath(env);
+  name: string,
+): Promise<ParsedSystemdUnit | null> {
+  const unitPath = resolveSystemdUnitPathForName(env, name);
   try {
     const content = await fs.readFile(unitPath, "utf8");
     let execStart = "";
@@ -90,19 +117,100 @@ export async function readSystemdServiceExecStart(
         }
       }
     }
-    if (!execStart) {
-      return null;
-    }
-    const programArguments = parseSystemdExecStart(execStart);
     return {
-      programArguments,
+      name,
+      unitPath,
+      ...(execStart ? { execStart } : {}),
       ...(workingDirectory ? { workingDirectory } : {}),
-      ...(Object.keys(environment).length > 0 ? { environment } : {}),
-      sourcePath: unitPath,
+      environment,
+      marker: environment.OPENCLAW_SERVICE_MARKER === "openclaw",
+      kindGateway: environment.OPENCLAW_SERVICE_KIND === "gateway",
     };
   } catch {
     return null;
   }
+}
+
+export async function findMatchingSystemdUserUnit(
+  env: Record<string, string | undefined>,
+): Promise<ParsedSystemdUnit | null> {
+  const override = env.OPENCLAW_SYSTEMD_UNIT?.trim();
+  if (override) {
+    const name = override.endsWith(".service") ? override.slice(0, -".service".length) : override;
+    return await readParsedSystemdUnit(env, name);
+  }
+
+  const desiredName = resolveGatewaySystemdServiceName(env.OPENCLAW_PROFILE);
+  const desiredUnit = await readParsedSystemdUnit(env, desiredName);
+  const desiredScore = desiredUnit ? scoreParsedSystemdUnit(desiredUnit, env, desiredName) : -1;
+  if (desiredUnit && desiredScore >= 100) {
+    return desiredUnit;
+  }
+
+  const home = toPosixPath(resolveHomeDir(env));
+  const userDir = path.posix.join(home, ".config", "systemd", "user");
+  let entries: string[] = [];
+  try {
+    entries = await fs.readdir(userDir);
+  } catch {
+    return desiredUnit;
+  }
+
+  let best = desiredUnit;
+  let bestScore = desiredScore;
+  for (const entry of entries) {
+    if (!entry.endsWith(".service")) {
+      continue;
+    }
+    const name = entry.slice(0, -".service".length);
+    if (name === desiredName) {
+      continue;
+    }
+    if (!name.startsWith("openclaw-gateway")) {
+      continue;
+    }
+    const parsed = await readParsedSystemdUnit(env, name);
+    if (!parsed) {
+      continue;
+    }
+    const score = scoreParsedSystemdUnit(parsed, env, desiredName);
+    if (score > bestScore) {
+      best = parsed;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+export function resolveSystemdUserUnitPath(env: Record<string, string | undefined>): string {
+  return resolveSystemdUnitPath(env);
+}
+
+export { enableSystemdUserLinger, readSystemdUserLingerStatus };
+export type { SystemdUserLingerStatus };
+
+// Unit file parsing/rendering: see systemd-unit.ts
+
+export async function readSystemdServiceExecStart(
+  env: Record<string, string | undefined>,
+): Promise<{
+  programArguments: string[];
+  workingDirectory?: string;
+  environment?: Record<string, string>;
+  sourcePath?: string;
+} | null> {
+  const unit = await findMatchingSystemdUserUnit(env);
+  if (!unit?.execStart) {
+    return null;
+  }
+  const programArguments = parseSystemdExecStart(unit.execStart);
+  return {
+    programArguments,
+    ...(unit.workingDirectory ? { workingDirectory: unit.workingDirectory } : {}),
+    ...(Object.keys(unit.environment).length > 0 ? { environment: unit.environment } : {}),
+    sourcePath: unit.unitPath,
+  };
 }
 
 export type SystemdServiceInfo = {
@@ -229,7 +337,8 @@ export async function installSystemdService({
 }): Promise<{ unitPath: string }> {
   await assertSystemdAvailable();
 
-  const unitPath = resolveSystemdUnitPath(env);
+  const existingUnit = await findMatchingSystemdUserUnit(env);
+  const unitPath = existingUnit?.unitPath ?? resolveSystemdUnitPath(env);
   await fs.mkdir(path.dirname(unitPath), { recursive: true });
   const serviceDescription =
     description ??
@@ -245,7 +354,7 @@ export async function installSystemdService({
   });
   await fs.writeFile(unitPath, unit, "utf8");
 
-  const serviceName = resolveGatewaySystemdServiceName(env.OPENCLAW_PROFILE);
+  const serviceName = existingUnit?.name ?? resolveGatewaySystemdServiceName(env.OPENCLAW_PROFILE);
   const unitName = `${serviceName}.service`;
   const reload = await execSystemctl(["--user", "daemon-reload"]);
   if (reload.code !== 0) {
@@ -276,11 +385,12 @@ export async function uninstallSystemdService({
   stdout: NodeJS.WritableStream;
 }): Promise<void> {
   await assertSystemdAvailable();
-  const serviceName = resolveGatewaySystemdServiceName(env.OPENCLAW_PROFILE);
+  const existingUnit = await findMatchingSystemdUserUnit(env);
+  const serviceName = existingUnit?.name ?? resolveGatewaySystemdServiceName(env.OPENCLAW_PROFILE);
   const unitName = `${serviceName}.service`;
   await execSystemctl(["--user", "disable", "--now", unitName]);
 
-  const unitPath = resolveSystemdUnitPath(env);
+  const unitPath = existingUnit?.unitPath ?? resolveSystemdUnitPath(env);
   try {
     await fs.unlink(unitPath);
     stdout.write(`${formatLine("Removed systemd service", unitPath)}\n`);
@@ -297,7 +407,8 @@ export async function stopSystemdService({
   env?: Record<string, string | undefined>;
 }): Promise<void> {
   await assertSystemdAvailable();
-  const serviceName = resolveSystemdServiceName(env ?? {});
+  const serviceName =
+    (await findMatchingSystemdUserUnit(env ?? {}))?.name ?? resolveSystemdServiceName(env ?? {});
   const unitName = `${serviceName}.service`;
   const res = await execSystemctl(["--user", "stop", unitName]);
   if (res.code !== 0) {
@@ -314,7 +425,8 @@ export async function restartSystemdService({
   env?: Record<string, string | undefined>;
 }): Promise<void> {
   await assertSystemdAvailable();
-  const serviceName = resolveSystemdServiceName(env ?? {});
+  const serviceName =
+    (await findMatchingSystemdUserUnit(env ?? {}))?.name ?? resolveSystemdServiceName(env ?? {});
   const unitName = `${serviceName}.service`;
   const res = await execSystemctl(["--user", "restart", unitName]);
   if (res.code !== 0) {
@@ -327,7 +439,9 @@ export async function isSystemdServiceEnabled(args: {
   env?: Record<string, string | undefined>;
 }): Promise<boolean> {
   await assertSystemdAvailable();
-  const serviceName = resolveSystemdServiceName(args.env ?? {});
+  const serviceName =
+    (await findMatchingSystemdUserUnit(args.env ?? {}))?.name ??
+    resolveSystemdServiceName(args.env ?? {});
   const unitName = `${serviceName}.service`;
   const res = await execSystemctl(["--user", "is-enabled", unitName]);
   return res.code === 0;
@@ -344,7 +458,8 @@ export async function readSystemdServiceRuntime(
       detail: String(err),
     };
   }
-  const serviceName = resolveSystemdServiceName(env);
+  const serviceName =
+    (await findMatchingSystemdUserUnit(env))?.name ?? resolveSystemdServiceName(env);
   const unitName = `${serviceName}.service`;
   const res = await execSystemctl([
     "--user",

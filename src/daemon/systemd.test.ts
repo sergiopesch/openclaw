@@ -1,6 +1,14 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { parseSystemdShow, resolveSystemdUserUnitPath } from "./systemd.js";
+import {
+  findMatchingSystemdUserUnit,
+  parseSystemdShow,
+  readSystemdServiceExecStart,
+  resolveSystemdUserUnitPath,
+} from "./systemd.js";
 
 describe("systemd runtime parsing", () => {
   it("parses active state details", () => {
@@ -92,5 +100,41 @@ describe("resolveSystemdUserUnitPath", () => {
     expect(resolveSystemdUserUnitPath(env)).toBe(
       "/home/test/.config/systemd/user/openclaw-gateway-myprofile.service",
     );
+  });
+});
+
+describe("systemd unit discovery", () => {
+  it("finds a generic gateway unit when it matches the profiled state dir", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-systemd-"));
+    const userDir = path.join(home, ".config", "systemd", "user");
+    await fs.mkdir(userDir, { recursive: true });
+    const stateDir = path.join(home, ".openclaw-laptop-local");
+    await fs.writeFile(
+      path.join(userDir, "openclaw-gateway.service"),
+      [
+        "[Service]",
+        "ExecStart=/usr/bin/node /opt/openclaw gateway --port 18789",
+        `Environment=OPENCLAW_STATE_DIR=${stateDir}`,
+        `Environment=OPENCLAW_CONFIG_PATH=${path.join(stateDir, "openclaw.json")}`,
+        "Environment=OPENCLAW_SERVICE_MARKER=openclaw",
+        "Environment=OPENCLAW_SERVICE_KIND=gateway",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const env = {
+      HOME: home,
+      OPENCLAW_PROFILE: "laptop-local",
+      OPENCLAW_STATE_DIR: stateDir,
+      OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
+    };
+
+    const match = await findMatchingSystemdUserUnit(env);
+    expect(match?.name).toBe("openclaw-gateway");
+
+    const command = await readSystemdServiceExecStart(env);
+    expect(command?.sourcePath).toBe(path.join(userDir, "openclaw-gateway.service"));
+    expect(command?.environment?.OPENCLAW_STATE_DIR).toBe(stateDir);
   });
 });
