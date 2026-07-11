@@ -214,11 +214,11 @@ The implemented foundation has passed:
 - deterministic protocol generation checks
 - Oxlint, Oxfmt, SwiftFormat, Swift parse, and `git diff --check`
 - Simulator build, launch, accessibility inspection, start, and stop interaction
-- targeted independent review with no remaining actionable finding
+- targeted independent review
 
-The canonical local Xcode project could not complete manifest compilation on the corporate machine because endpoint security terminated package-manifest processes containing the project names. The same source modules built and tested successfully in a neutral temporary harness. That workaround changed no canonical project or formatter configuration.
+GitHub Actions now validates the generated canonical Xcode project on a hosted Apple runner. The required validation path passed 622 shared Swift tests across 59 suites and 155 focused iOS interaction tests across 3 suites, then installed and launched the app in an iPhone Simulator and retained the test logs, result bundle, and launch screenshot as workflow artifacts.
 
-This distinction matters: source behavior has broad automated proof, while a clean canonical-project build still needs proof on an unrestricted Apple host.
+The optional full iOS suite currently passes 666 of 668 tests. Its two failures are pre-existing source guards outside this interaction-layer change: shared Chat UI typography branding and the Root Tabs local-network source invariant. They are not excluded from the optional full-suite result, but they do not gate the focused interaction workflow.
 
 ## Remote Apple Test Lab
 
@@ -286,5 +286,5 @@ Before extending this work:
 3. Run focused Gateway, protocol, and iOS projection tests before changing behavior.
 4. Preserve the actor, adapter, protocol, and client-projection ownership boundaries.
 5. Add the typed event envelope without expanding Chat or Talk UI structure.
-6. Validate the canonical Xcode project on an unrestricted Apple host.
+6. Keep the canonical Xcode project green on the hosted Apple validation workflow.
 7. Keep remote-provider and physical-device proof separate from deterministic unit proof.

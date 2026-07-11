@@ -1,0 +1,240 @@
+name: iOS Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_full_ios_tests:
+        description: Run the full iOS unit test scheme after interaction tests
+        required: false
+        default: false
+        type: boolean
+      run_ui_tests:
+        description: Run the full iOS UI test scheme after unit tests
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - codex/ios-interaction-layer-foundation
+    paths:
+      - ".github/actions/setup-node-env/**"
+      - ".github/actions/setup-pnpm-store-cache/**"
+      - ".github/workflows/ios-validation.yml"
+      - "apps/ios/**"
+      - "apps/shared/OpenClawKit/**"
+      - "apps/swabble/**"
+      - "config/swiftformat"
+      - "config/swiftlint.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "scripts/ios-*.mjs"
+      - "scripts/ios-*.sh"
+      - "scripts/ios-*.ts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  IOS_ARTIFACTS_DIR: .local/ios-validation
+  IOS_DERIVED_DATA_DIR: .local/ios-derived-data
+
+jobs:
+  validate:
+    name: Swift, XCTest, and Simulator
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+          for xcode_app in /Applications/Xcode_26.5.app /Applications/Xcode-26.5.0.app; do
+            if [ -d "$xcode_app/Contents/Developer" ]; then
+              sudo xcode-select -s "$xcode_app/Contents/Developer"
+              break
+            fi
+          done
+          xcodebuild -version
+          swift --version
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          install-bun: "false"
+
+      - name: Install Swift tooling
+        run: brew install xcodegen swiftlint swiftformat
+
+      - name: Prepare iOS project
+        run: |
+          set -euo pipefail
+          mkdir -p "$IOS_ARTIFACTS_DIR"
+          pnpm ios:gen
+
+      - name: Select and boot iPhone Simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          selection="$({ xcrun simctl list devices available --json; } | python3 -c '
+          import json
+          import sys
+
+          data = json.load(sys.stdin)
+          phones = []
+          for runtime, devices in data.get("devices", {}).items():
+              for device in devices:
+                  name = device.get("name", "")
+                  udid = device.get("udid", "")
+                  if device.get("isAvailable") and name.startswith("iPhone") and udid:
+                      phones.append((name, udid, runtime))
+
+          if not phones:
+              raise SystemExit("No available iPhone Simulator is installed")
+
+          preferred = [phone for phone in phones if phone[0].startswith("iPhone 17")]
+          name, udid, runtime = (preferred or phones)[0]
+          print(f"{udid}\t{name}\t{runtime}")
+          ')"
+          IFS=$'\t' read -r simulator_udid simulator_name simulator_runtime <<< "$selection"
+          echo "udid=$simulator_udid" >> "$GITHUB_OUTPUT"
+          echo "name=$simulator_name" >> "$GITHUB_OUTPUT"
+          echo "runtime=$simulator_runtime" >> "$GITHUB_OUTPUT"
+          echo "Selected $simulator_name ($simulator_runtime, $simulator_udid)"
+          xcrun simctl boot "$simulator_udid"
+          xcrun simctl bootstatus "$simulator_udid" -b
+
+      - name: Test shared Swift package
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if swift test \
+              --package-path apps/shared/OpenClawKit \
+              2>&1 | tee "$IOS_ARTIFACTS_DIR/shared-swift-tests-attempt-$attempt.log"
+            then
+              exit 0
+            fi
+            echo "Shared Swift tests failed (attempt $attempt/3). Retrying…"
+          done
+          exit 1
+
+      - name: Run iOS interaction tests
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project apps/ios/OpenClaw.xcodeproj \
+            -scheme OpenClaw \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$IOS_DERIVED_DATA_DIR" \
+            -resultBundlePath "$IOS_ARTIFACTS_DIR/OpenClawInteractionTests.xcresult" \
+            -only-testing:OpenClawTests/InteractionSessionStoreTests \
+            -only-testing:OpenClawTests/NodeAppModelInvokeTests \
+            -only-testing:OpenClawTests/RealtimeTalkRelaySessionTests \
+            test \
+            2>&1 | tee "$IOS_ARTIFACTS_DIR/ios-interaction-tests.log"
+
+      - name: Run full iOS test suite
+        if: github.event_name == 'workflow_dispatch' && inputs.run_full_ios_tests
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project apps/ios/OpenClaw.xcodeproj \
+            -scheme OpenClaw \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$IOS_DERIVED_DATA_DIR" \
+            -resultBundlePath "$IOS_ARTIFACTS_DIR/OpenClawTests.xcresult" \
+            test \
+            2>&1 | tee "$IOS_ARTIFACTS_DIR/ios-unit-tests.log"
+
+      - name: Run iOS UI tests
+        if: github.event_name == 'workflow_dispatch' && inputs.run_ui_tests
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project apps/ios/OpenClaw.xcodeproj \
+            -scheme OpenClawUITests \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$IOS_DERIVED_DATA_DIR" \
+            -resultBundlePath "$IOS_ARTIFACTS_DIR/OpenClawUITests.xcresult" \
+            test \
+            2>&1 | tee "$IOS_ARTIFACTS_DIR/ios-ui-tests.log"
+
+      - name: Install and launch Simulator app
+        if: always() && steps.simulator.outputs.udid != ''
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          app_path="$IOS_DERIVED_DATA_DIR/Build/Products/Debug-iphonesimulator/OpenClaw.app"
+          if [ ! -d "$app_path" ]; then
+            echo "Built app not found at $app_path" >&2
+            exit 1
+          fi
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Info.plist")"
+          xcrun simctl install "$SIMULATOR_UDID" "$app_path"
+          xcrun simctl get_app_container "$SIMULATOR_UDID" "$bundle_id" app
+          xcrun simctl launch --terminate-running-process "$SIMULATOR_UDID" "$bundle_id" \
+            | tee "$IOS_ARTIFACTS_DIR/simulator-launch.log"
+          sleep 5
+          xcrun simctl io "$SIMULATOR_UDID" screenshot \
+            "$IOS_ARTIFACTS_DIR/simulator-launch.png"
+          xcrun simctl spawn "$SIMULATOR_UDID" log show \
+            --last 2m \
+            --style compact \
+            --predicate 'process == "OpenClaw"' \
+            > "$IOS_ARTIFACTS_DIR/simulator-system.log"
+
+      - name: Package failed test results
+        if: failure()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for result_bundle in "$IOS_ARTIFACTS_DIR"/*.xcresult; do
+            ditto -c -k --sequesterRsrc --keepParent \
+              "$result_bundle" "$result_bundle.zip"
+          done
+
+      - name: Upload Simulator evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-simulator-evidence-${{ github.run_attempt }}
+          path: |
+            ${{ env.IOS_ARTIFACTS_DIR }}/*.log
+            ${{ env.IOS_ARTIFACTS_DIR }}/*.png
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Upload failed XCTest bundles
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-xcresult-failure-${{ github.run_attempt }}
+          path: ${{ env.IOS_ARTIFACTS_DIR }}/*.xcresult.zip
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Shut down Simulator
+        if: always() && steps.simulator.outputs.udid != ''
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: xcrun simctl shutdown "$SIMULATOR_UDID" || true
