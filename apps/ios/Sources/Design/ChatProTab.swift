@@ -261,16 +261,31 @@ struct ChatProTab: View {
     }
 
     private var talkControl: OpenClawChatTalkControl {
-        OpenClawChatTalkControl(
-            isEnabled: self.appModel.talkMode.isEnabled,
+        let actionState = self.appModel.interactionActionState(
+            for: self.viewModel?.sessionKey ?? self.appModel.chatSessionKey)
+        return OpenClawChatTalkControl(
+            actionState: actionState,
             isListening: self.appModel.talkMode.isListening,
             isSpeaking: self.appModel.talkMode.isSpeaking,
             isGatewayConnected: self.appModel.talkMode.isGatewayConnected,
             statusText: self.appModel.talkMode.statusText,
             providerLabel: self.appModel.talkMode.gatewayTalkProviderLabel,
-            toggle: { sessionKey in
+            performAction: { sessionKey in
+                let currentAction = self.appModel.interactionActionState(for: sessionKey)
                 self.appModel.focusChatSession(sessionKey)
-                self.appModel.setTalkEnabled(!self.appModel.talkMode.isEnabled)
+                switch currentAction {
+                case .localActive:
+                    self.appModel.setTalkEnabled(false)
+                case .idle:
+                    self.appModel.setTalkEnabled(true, sessionKey: sessionKey)
+                case .remoteActive:
+                    self.appModel.setTalkEnabled(
+                        true,
+                        sessionKey: sessionKey,
+                        allowCanonicalTakeover: true)
+                case .unavailable:
+                    break
+                }
             })
     }
 

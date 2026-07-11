@@ -9,6 +9,7 @@ import { coreGatewayHandlers } from "./server-methods.js";
 describe("GATEWAY_EVENTS", () => {
   it("advertises Talk event streams in hello features", () => {
     expect(GATEWAY_EVENTS).toContain("talk.event");
+    expect(GATEWAY_EVENTS).toContain("interaction.session.changed");
     expect(GATEWAY_EVENTS).not.toContain("talk.realtime.relay");
     expect(GATEWAY_EVENTS).not.toContain("talk.transcription.relay");
   });
@@ -27,6 +28,11 @@ describe("listGatewayMethods", () => {
 
   it("advertises Control UI GitHub previews", () => {
     expect(listGatewayMethods()).toContain("controlUi.githubPreview");
+  });
+
+  it("advertises a dispatchable interaction-session lookup", () => {
+    expect(listGatewayMethods()).toContain("interaction.session.get");
+    expect(coreGatewayHandlers["interaction.session.get"]).toBeTypeOf("function");
   });
 
   it("does not advertise hidden core handlers", () => {

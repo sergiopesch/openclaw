@@ -221,6 +221,15 @@ import {
   TickEventSchema,
 } from "./frames.js";
 import {
+  InteractionRuntimeKindSchema,
+  InteractionSessionActiveProjectionSchema,
+  InteractionSessionClosedProjectionSchema,
+  InteractionSessionGetParamsSchema,
+  InteractionSessionGetResultSchema,
+  InteractionSessionProjectionSchema,
+  InteractionSessionReplacedProjectionSchema,
+} from "./interaction-sessions.js";
+import {
   ChatAbortedEventSchema,
   ChatAbortParamsSchema,
   ChatDeltaEventSchema,
@@ -494,6 +503,13 @@ export const ProtocolSchemas = {
   SessionsDeleteParams: SessionsDeleteParamsSchema,
   SessionsCompactParams: SessionsCompactParamsSchema,
   SessionsUsageParams: SessionsUsageParamsSchema,
+  InteractionRuntimeKind: InteractionRuntimeKindSchema,
+  InteractionSessionActiveProjection: InteractionSessionActiveProjectionSchema,
+  InteractionSessionReplacedProjection: InteractionSessionReplacedProjectionSchema,
+  InteractionSessionClosedProjection: InteractionSessionClosedProjectionSchema,
+  InteractionSessionProjection: InteractionSessionProjectionSchema,
+  InteractionSessionGetParams: InteractionSessionGetParamsSchema,
+  InteractionSessionGetResult: InteractionSessionGetResultSchema,
 
   // Audit/task ledgers and config/wizard setup payloads.
   AuditEvent: AuditEventSchema,

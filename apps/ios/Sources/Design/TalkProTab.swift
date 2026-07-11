@@ -267,6 +267,12 @@ struct TalkProTab: View {
         {
             self.stopTalk()
         } else if self.talkEnabled != self.appModel.talkMode.isEnabled {
+            if self.talkEnabled {
+                guard self.appModel.talkMode.gatewayTalkConfigLoaded,
+                      self.appModel.interactionActionState(
+                          for: self.appModel.chatSessionKey) == .idle
+                else { return }
+            }
             self.appModel.setTalkEnabled(self.talkEnabled)
         }
     }
@@ -298,9 +304,12 @@ struct TalkProTab: View {
 
     private func startTalk() {
         guard !self.appModel.isAppleReviewDemoModeEnabled else { return }
+        guard self.appModel.interactionActionState(for: self.appModel.chatSessionKey) == .idle else {
+            self.talkEnabled = false
+            return
+        }
         self.talkEnabled = true
-        self.appModel.talkMode.updateMainSessionKey(self.appModel.chatSessionKey)
-        self.appModel.setTalkEnabled(true)
+        self.appModel.setTalkEnabled(true, sessionKey: self.appModel.chatSessionKey)
     }
 
     private func stopTalk() {

@@ -57,6 +57,12 @@ public enum SessionFileRelevance: String, Codable, Sendable {
     case mixed = "mixed"
 }
 
+public enum InteractionRuntimeKind: String, Codable, Sendable {
+    case managedRoom = "managed-room"
+    case realtimeVoice = "realtime-voice"
+    case transcription = "transcription"
+}
+
 public enum TaskSuggestionResolution: String, Codable, Sendable {
     case dismissed = "dismissed"
     case accepted = "accepted"
@@ -3100,6 +3106,140 @@ public struct SessionsUsageParams: Codable, Sendable {
         case utcoffset = "utcOffset"
         case limit
         case includecontextweight = "includeContextWeight"
+    }
+}
+
+public struct InteractionSessionActiveProjection: Codable, Sendable {
+    public let interactionsessionid: String
+    public let sessionkey: String
+    public let epoch: Int
+    public let runtimeid: String
+    public let runtimekind: InteractionRuntimeKind
+    public let state: String
+
+    public init(
+        interactionsessionid: String,
+        sessionkey: String,
+        epoch: Int,
+        runtimeid: String,
+        runtimekind: InteractionRuntimeKind,
+        state: String)
+    {
+        self.interactionsessionid = interactionsessionid
+        self.sessionkey = sessionkey
+        self.epoch = epoch
+        self.runtimeid = runtimeid
+        self.runtimekind = runtimekind
+        self.state = state
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case interactionsessionid = "interactionSessionId"
+        case sessionkey = "sessionKey"
+        case epoch
+        case runtimeid = "runtimeId"
+        case runtimekind = "runtimeKind"
+        case state
+    }
+}
+
+public struct InteractionSessionReplacedProjection: Codable, Sendable {
+    public let interactionsessionid: String
+    public let sessionkey: String
+    public let epoch: Int
+    public let runtimeid: String
+    public let runtimekind: InteractionRuntimeKind
+    public let state: String
+
+    public init(
+        interactionsessionid: String,
+        sessionkey: String,
+        epoch: Int,
+        runtimeid: String,
+        runtimekind: InteractionRuntimeKind,
+        state: String)
+    {
+        self.interactionsessionid = interactionsessionid
+        self.sessionkey = sessionkey
+        self.epoch = epoch
+        self.runtimeid = runtimeid
+        self.runtimekind = runtimekind
+        self.state = state
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case interactionsessionid = "interactionSessionId"
+        case sessionkey = "sessionKey"
+        case epoch
+        case runtimeid = "runtimeId"
+        case runtimekind = "runtimeKind"
+        case state
+    }
+}
+
+public struct InteractionSessionClosedProjection: Codable, Sendable {
+    public let interactionsessionid: String
+    public let sessionkey: String
+    public let epoch: Int
+    public let runtimeid: String
+    public let runtimekind: InteractionRuntimeKind
+    public let state: String
+
+    public init(
+        interactionsessionid: String,
+        sessionkey: String,
+        epoch: Int,
+        runtimeid: String,
+        runtimekind: InteractionRuntimeKind,
+        state: String)
+    {
+        self.interactionsessionid = interactionsessionid
+        self.sessionkey = sessionkey
+        self.epoch = epoch
+        self.runtimeid = runtimeid
+        self.runtimekind = runtimekind
+        self.state = state
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case interactionsessionid = "interactionSessionId"
+        case sessionkey = "sessionKey"
+        case epoch
+        case runtimeid = "runtimeId"
+        case runtimekind = "runtimeKind"
+        case state
+    }
+}
+
+public struct InteractionSessionGetParams: Codable, Sendable {
+    public let sessionkey: String
+
+    public init(
+        sessionkey: String)
+    {
+        self.sessionkey = sessionkey
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionkey = "sessionKey"
+    }
+}
+
+public struct InteractionSessionGetResult: Codable, Sendable {
+    public let sessionkey: String
+    public let projection: InteractionSessionActiveProjection?
+
+    public init(
+        sessionkey: String,
+        projection: InteractionSessionActiveProjection?)
+    {
+        self.sessionkey = sessionkey
+        self.projection = projection
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionkey = "sessionKey"
+        case projection
     }
 }
 
@@ -9401,6 +9541,40 @@ public struct ShutdownEvent: Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case reason
         case restartexpectedms = "restartExpectedMs"
+    }
+}
+
+public enum InteractionSessionProjection: Codable, Sendable {
+    case active(InteractionSessionActiveProjection)
+    case replaced(InteractionSessionReplacedProjection)
+    case closed(InteractionSessionClosedProjection)
+
+    private enum CodingKeys: String, CodingKey {
+        case discriminator = "state"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let discriminator = try container.decode(String.self, forKey: .discriminator)
+        switch discriminator {
+        case "active": self = try .active(InteractionSessionActiveProjection(from: decoder))
+        case "replaced": self = try .replaced(InteractionSessionReplacedProjection(from: decoder))
+        case "closed": self = try .closed(InteractionSessionClosedProjection(from: decoder))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .discriminator,
+                in: container,
+                debugDescription: "Unknown InteractionSessionProjection discriminator value"
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .active(let value): try value.encode(to: encoder)
+        case .replaced(let value): try value.encode(to: encoder)
+        case .closed(let value): try value.encode(to: encoder)
+        }
     }
 }
 

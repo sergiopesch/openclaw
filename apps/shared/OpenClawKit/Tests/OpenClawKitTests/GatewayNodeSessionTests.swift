@@ -87,6 +87,7 @@ private final class FirstCancelGate: @unchecked Sendable {
 private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Sendable {
     private let lock = NSLock()
     private let helloAuth: [String: Any]?
+    private let helloFeatures: [String: Any]?
     private let connectError: [String: Any]?
     private let cancelGate: FirstCancelGate?
     private var _state: URLSessionTask.State = .suspended
@@ -101,10 +102,12 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
 
     init(
         helloAuth: [String: Any]? = nil,
+        helloFeatures: [String: Any]? = nil,
         connectError: [String: Any]? = nil,
         cancelGate: FirstCancelGate? = nil)
     {
         self.helloAuth = helloAuth
+        self.helloFeatures = helloFeatures
         self.connectError = connectError
         self.cancelGate = cancelGate
     }
@@ -200,14 +203,20 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
                 if let connectError {
                     return .data(Self.connectErrorData(id: id, error: connectError))
                 }
-                return .data(Self.connectOkData(id: id, auth: self.helloAuth))
+                return .data(Self.connectOkData(
+                    id: id,
+                    auth: self.helloAuth,
+                    features: self.helloFeatures))
             }
             try await Task.sleep(nanoseconds: 1_000_000)
         }
         if let connectError {
             return .data(Self.connectErrorData(id: "connect", error: connectError))
         }
-        return .data(Self.connectOkData(id: "connect", auth: self.helloAuth))
+        return .data(Self.connectOkData(
+            id: "connect",
+            auth: self.helloAuth,
+            features: self.helloFeatures))
     }
 
     func receive(
@@ -233,6 +242,17 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
     }
 
     func emitInvokeRequest(id: String, command: String, paramsJSON: String?) {
+        self.emitServerMessage(Self.invokeRequestData(
+            id: id,
+            command: command,
+            paramsJSON: paramsJSON))
+    }
+
+    func emitServerEvent(event: String, seq: Int) {
+        self.emitServerMessage(Self.serverEventData(event: event, seq: seq))
+    }
+
+    private func emitServerMessage(_ data: Data) {
         let handler = self.lock.withLock { () -> (@Sendable (Result<
             URLSessionWebSocketTask.Message,
             Error,
@@ -240,10 +260,7 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
             defer { self.pendingReceiveHandler = nil }
             return self.pendingReceiveHandler
         }
-        handler?(.success(.data(Self.invokeRequestData(
-            id: id,
-            command: command,
-            paramsJSON: paramsJSON))))
+        handler?(.success(.data(data)))
     }
 
     private static func connectChallengeData(nonce: String) -> Data {
@@ -255,7 +272,11 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
         return (try? JSONSerialization.data(withJSONObject: frame)) ?? Data()
     }
 
-    private static func connectOkData(id: String, auth: [String: Any]? = nil) -> Data {
+    private static func connectOkData(
+        id: String,
+        auth: [String: Any]? = nil,
+        features: [String: Any]? = nil) -> Data
+    {
         var payload: [String: Any] = [
             "type": "hello-ok",
             "protocol": 2,
@@ -263,7 +284,7 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
                 "version": "test",
                 "connId": "test",
             ],
-            "features": [
+            "features": features ?? [
                 "methods": [],
                 "events": [],
             ],
@@ -319,11 +340,21 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
         ]
         return (try? JSONSerialization.data(withJSONObject: frame)) ?? Data()
     }
+
+    private static func serverEventData(event: String, seq: Int) -> Data {
+        let frame: [String: Any] = [
+            "type": "event",
+            "event": event,
+            "seq": seq,
+        ]
+        return (try? JSONSerialization.data(withJSONObject: frame)) ?? Data()
+    }
 }
 
 private final class FakeGatewayWebSocketSession: WebSocketSessioning, @unchecked Sendable {
     private let lock = NSLock()
     private let helloAuth: [String: Any]?
+    private let helloFeatures: [String: Any]?
     private let connectError: [String: Any]?
     private let cancelGate: FirstCancelGate?
     private var tasks: [FakeGatewayWebSocketTask] = []
@@ -332,10 +363,12 @@ private final class FakeGatewayWebSocketSession: WebSocketSessioning, @unchecked
 
     init(
         helloAuth: [String: Any]? = nil,
+        helloFeatures: [String: Any]? = nil,
         connectError: [String: Any]? = nil,
         cancelGate: FirstCancelGate? = nil)
     {
         self.helloAuth = helloAuth
+        self.helloFeatures = helloFeatures
         self.connectError = connectError
         self.cancelGate = cancelGate
     }
@@ -362,6 +395,7 @@ private final class FakeGatewayWebSocketSession: WebSocketSessioning, @unchecked
             self.requests.append(request)
             let task = FakeGatewayWebSocketTask(
                 helloAuth: self.helloAuth,
+                helloFeatures: self.helloFeatures,
                 connectError: self.connectError,
                 cancelGate: self.cancelGate)
             self.tasks.append(task)
@@ -406,6 +440,31 @@ private actor SeqGapProbe {
     }
 }
 
+private actor FeatureResetProbe {
+    private var route: GatewayNodeSessionRoute?
+    private var recorded = false
+    private var methodSupport: Bool?
+    private var eventSupport: Bool?
+
+    func setRoute(_ route: GatewayNodeSessionRoute) {
+        self.route = route
+    }
+
+    func currentRoute() -> GatewayNodeSessionRoute? {
+        self.route
+    }
+
+    func record(methodSupport: Bool?, eventSupport: Bool?) {
+        self.recorded = true
+        self.methodSupport = methodSupport
+        self.eventSupport = eventSupport
+    }
+
+    func result() -> (recorded: Bool, methodSupport: Bool?, eventSupport: Bool?) {
+        (self.recorded, self.methodSupport, self.eventSupport)
+    }
+}
+
 private actor DisconnectProbe {
     private var reasons: [String] = []
 
@@ -416,6 +475,34 @@ private actor DisconnectProbe {
     func values() -> [String] {
         self.reasons
     }
+}
+
+private func connectOperatorGateway(
+    _ gateway: GatewayNodeSession,
+    session: FakeGatewayWebSocketSession,
+    url rawURL: String,
+    onDisconnected: @escaping @Sendable (String) async -> Void = { _ in }) async throws
+{
+    let options = GatewayConnectOptions(
+        role: "operator",
+        scopes: ["operator.read"],
+        caps: [],
+        commands: [],
+        permissions: [:],
+        clientId: "openclaw-ios-test",
+        clientMode: "ui",
+        clientDisplayName: "iOS Test",
+        includeDeviceIdentity: false)
+    try await gateway.connect(
+        url: #require(URL(string: rawURL)),
+        token: nil,
+        bootstrapToken: nil,
+        password: nil,
+        connectOptions: options,
+        sessionBox: WebSocketSessionBox(session: session),
+        onConnected: {},
+        onDisconnected: onDisconnected,
+        onInvoke: { req in BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: nil, error: nil) })
 }
 
 @Suite(.serialized)
@@ -649,6 +736,108 @@ struct GatewayNodeSessionTests {
         let replacementTask = try #require(session.latestTask())
         #expect(replacementTask.sentRequestCount(method: "node.event") == 0)
         #expect(replacementTask.sentRequestCount(method: "exec.approval.get") == 0)
+    }
+
+    @Test
+    func `server feature detection is guarded by the current route`() async throws {
+        let session = FakeGatewayWebSocketSession(helloFeatures: [
+            "methods": ["interaction.session.get", "interaction.session.subscribe"],
+            "events": ["interaction.session.updated"],
+        ])
+        let gateway = GatewayNodeSession()
+        try await connectOperatorGateway(
+            gateway,
+            session: session,
+            url: "ws://first.example.invalid")
+        let firstRoute = try #require(await gateway.currentRoute())
+
+        #expect(await gateway.supportsServerMethod(
+            "interaction.session.get",
+            ifCurrentRoute: firstRoute) == true)
+        #expect(await gateway.supportsServerMethod(
+            "interaction.session.delete",
+            ifCurrentRoute: firstRoute) == false)
+        #expect(await gateway.supportsServerEvent(
+            "interaction.session.updated",
+            ifCurrentRoute: firstRoute) == true)
+        #expect(await gateway.supportsServerEvent(
+            "interaction.session.deleted",
+            ifCurrentRoute: firstRoute) == false)
+
+        try await connectOperatorGateway(
+            gateway,
+            session: session,
+            url: "ws://second.example.invalid")
+
+        #expect(await gateway.supportsServerMethod(
+            "interaction.session.get",
+            ifCurrentRoute: firstRoute) == nil)
+        #expect(await gateway.supportsServerEvent(
+            "interaction.session.updated",
+            ifCurrentRoute: firstRoute) == nil)
+
+        let secondRoute = try #require(await gateway.currentRoute())
+        #expect(await gateway.supportsServerMethod(
+            "interaction.session.get",
+            ifCurrentRoute: secondRoute) == true)
+        #expect(await gateway.supportsServerEvent(
+            "interaction.session.updated",
+            ifCurrentRoute: secondRoute) == true)
+
+        await gateway.disconnect()
+        #expect(await gateway.supportsServerMethod(
+            "interaction.session.get",
+            ifCurrentRoute: secondRoute) == nil)
+        #expect(await gateway.supportsServerEvent(
+            "interaction.session.updated",
+            ifCurrentRoute: secondRoute) == nil)
+    }
+
+    @Test
+    func `connection reset clears advertised server features before reconnect`() async throws {
+        let session = FakeGatewayWebSocketSession(helloFeatures: [
+            "methods": ["interaction.session.get"],
+            "events": ["interaction.session.updated"],
+        ])
+        let gateway = GatewayNodeSession()
+        let resetProbe = FeatureResetProbe()
+        try await connectOperatorGateway(
+            gateway,
+            session: session,
+            url: "ws://example.invalid",
+            onDisconnected: { [weak gateway] _ in
+                guard let gateway else { return }
+                guard let route = await resetProbe.currentRoute() else { return }
+                let methodSupport = await gateway.supportsServerMethod(
+                    "interaction.session.get",
+                    ifCurrentRoute: route)
+                let eventSupport = await gateway.supportsServerEvent(
+                    "interaction.session.updated",
+                    ifCurrentRoute: route)
+                await resetProbe.record(
+                    methodSupport: methodSupport,
+                    eventSupport: eventSupport)
+            })
+        let currentRoute = await gateway.currentRoute()
+        let resetRoute = try #require(currentRoute)
+        #expect(await gateway.supportsServerMethod(
+            "interaction.session.get",
+            ifCurrentRoute: resetRoute) == true)
+        #expect(await gateway.supportsServerEvent(
+            "interaction.session.updated",
+            ifCurrentRoute: resetRoute) == true)
+        await resetProbe.setRoute(resetRoute)
+
+        let task = try #require(session.latestTask())
+        task.emitReceiveFailure()
+        try await waitUntil("feature state reset before reconnect") {
+            await resetProbe.result().recorded
+        }
+
+        let resetResult = await resetProbe.result()
+        #expect(resetResult.methodSupport == nil)
+        #expect(resetResult.eventSupport == nil)
+        await gateway.disconnect()
     }
 
     @Test
@@ -1627,6 +1816,154 @@ struct GatewayNodeSessionTests {
         #expect(GatewayChannelActor.resolveRequestTimeoutMs(0, defaultMs: 15000) == nil)
         #expect(GatewayChannelActor.resolveRequestTimeoutMs(nil, defaultMs: 15000) == 15000)
         #expect(GatewayChannelActor.resolveRequestTimeoutMs(30000, defaultMs: 15000) == 30000)
+    }
+
+    @Test
+    func `forwards wire sequence gaps to server event subscribers`() async throws {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        let options = GatewayConnectOptions(
+            role: "operator",
+            scopes: ["operator.read"],
+            caps: [],
+            commands: [],
+            permissions: [:],
+            clientId: "openclaw-ios-test",
+            clientMode: "ui",
+            clientDisplayName: "iOS Test",
+            includeDeviceIdentity: false)
+
+        let stream = await gateway.subscribeServerEvents(bufferingNewest: 32)
+        let probe = SeqGapProbe()
+        let listenTask = Task {
+            for await evt in stream {
+                if evt.event == "seqGap" {
+                    await probe.mark()
+                    return
+                }
+            }
+        }
+
+        try await gateway.connect(
+            url: #require(URL(string: "ws://example.invalid")),
+            token: nil,
+            bootstrapToken: nil,
+            password: nil,
+            connectOptions: options,
+            sessionBox: WebSocketSessionBox(session: session),
+            onConnected: {},
+            onDisconnected: { _ in },
+            onInvoke: { req in
+                BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: nil, error: nil)
+            })
+
+        let task = try #require(session.latestTask())
+        task.emitServerEvent(event: "interaction.session.updated", seq: 1)
+        try await waitUntil("receive loop rearmed after first sequenced event") {
+            task.hasPendingReceiveHandler()
+        }
+        #expect(await probe.value() == false)
+        task.emitServerEvent(event: "interaction.session.updated", seq: 3)
+        try await waitUntil("wire seqGap broadcast") {
+            await probe.value()
+        }
+
+        listenTask.cancel()
+        await gateway.disconnect()
+    }
+
+    @Test
+    func `filtered server event subscribers ignore unrelated traffic`() async throws {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        let options = GatewayConnectOptions(
+            role: "operator",
+            scopes: ["operator.read"],
+            caps: [],
+            commands: [],
+            permissions: [:],
+            clientId: "openclaw-ios-test",
+            clientMode: "ui",
+            clientDisplayName: "iOS Test",
+            includeDeviceIdentity: false)
+        let stream = await gateway.subscribeServerEvents(
+            bufferingNewest: 1,
+            events: ["interaction.session.changed"])
+        let firstEvent = Task<String?, Never> {
+            for await event in stream {
+                return event.event
+            }
+            return nil
+        }
+
+        try await gateway.connect(
+            url: #require(URL(string: "ws://example.invalid")),
+            token: nil,
+            bootstrapToken: nil,
+            password: nil,
+            connectOptions: options,
+            sessionBox: WebSocketSessionBox(session: session),
+            onConnected: {},
+            onDisconnected: { _ in },
+            onInvoke: { request in
+                BridgeInvokeResponse(id: request.id, ok: true, payloadJSON: nil, error: nil)
+            })
+
+        let task = try #require(session.latestTask())
+        task.emitServerEvent(event: "talk.mode", seq: 1)
+        try await waitUntil("receive loop rearmed after unrelated event") {
+            task.hasPendingReceiveHandler()
+        }
+        task.emitServerEvent(event: "interaction.session.changed", seq: 2)
+
+        #expect(await firstEvent.value == "interaction.session.changed")
+        await gateway.disconnect()
+    }
+
+    @Test
+    func `local subscriber overflow surfaces a sequence gap`() async throws {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        let options = GatewayConnectOptions(
+            role: "operator",
+            scopes: ["operator.read"],
+            caps: [],
+            commands: [],
+            permissions: [:],
+            clientId: "openclaw-ios-test",
+            clientMode: "ui",
+            clientDisplayName: "iOS Test",
+            includeDeviceIdentity: false)
+        let stream = await gateway.subscribeServerEvents(
+            bufferingNewest: 1,
+            events: ["interaction.session.changed"])
+
+        try await gateway.connect(
+            url: #require(URL(string: "ws://example.invalid")),
+            token: nil,
+            bootstrapToken: nil,
+            password: nil,
+            connectOptions: options,
+            sessionBox: WebSocketSessionBox(session: session),
+            onConnected: {},
+            onDisconnected: { _ in },
+            onInvoke: { request in
+                BridgeInvokeResponse(id: request.id, ok: true, payloadJSON: nil, error: nil)
+            })
+
+        let task = try #require(session.latestTask())
+        task.emitServerEvent(event: "interaction.session.changed", seq: 1)
+        try await waitUntil("receive loop rearmed after first buffered event") {
+            task.hasPendingReceiveHandler()
+        }
+        task.emitServerEvent(event: "interaction.session.changed", seq: 2)
+        try await waitUntil("receive loop rearmed after overflowing event") {
+            task.hasPendingReceiveHandler()
+        }
+
+        var iterator = stream.makeAsyncIterator()
+        #expect(await iterator.next()?.event == "seqGap")
+        await gateway.disconnect()
     }
 
     @Test

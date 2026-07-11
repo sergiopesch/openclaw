@@ -75,6 +75,8 @@ public actor GatewayNodeSession {
     private var hasNotifiedConnected = false
     private var snapshotReceived = false
     private var serverCapabilities: Set<GatewayServerCapability>?
+    private var serverMethods: Set<String>?
+    private var serverEvents: Set<String>?
     private var snapshotWaiters: [CheckedContinuation<Bool, Never>] = []
 
     static func invokeWithTimeout(
@@ -153,7 +155,12 @@ public actor GatewayNodeSession {
         return response
     }
 
-    private var serverEventSubscribers: [UUID: AsyncStream<EventFrame>.Continuation] = [:]
+    private struct ServerEventSubscriber {
+        let events: Set<String>?
+        let continuation: AsyncStream<EventFrame>.Continuation
+    }
+
+    private var serverEventSubscribers: [UUID: ServerEventSubscriber] = [:]
     private var pluginSurfaceUrls: [String: String] = [:]
 
     private struct PluginSurfaceRefreshResponse: Decodable {
@@ -370,6 +377,28 @@ public actor GatewayNodeSession {
         return serverCapabilities.contains(capability)
     }
 
+    public func supportsServerMethod(
+        _ method: String,
+        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute) -> Bool?
+    {
+        guard expectedRoute.channelGeneration == self.channelGeneration,
+              self.channel != nil,
+              let serverMethods
+        else { return nil }
+        return serverMethods.contains(method)
+    }
+
+    public func supportsServerEvent(
+        _ event: String,
+        ifCurrentRoute expectedRoute: GatewayNodeSessionRoute) -> Bool?
+    {
+        guard expectedRoute.channelGeneration == self.channelGeneration,
+              self.channel != nil,
+              let serverEvents
+        else { return nil }
+        return serverEvents.contains(event)
+    }
+
     @discardableResult
     public func sendEvent(
         event: String,
@@ -430,11 +459,16 @@ public actor GatewayNodeSession {
             timeoutMs: Double(timeoutSeconds * 1000))
     }
 
-    public func subscribeServerEvents(bufferingNewest: Int = 200) -> AsyncStream<EventFrame> {
+    public func subscribeServerEvents(
+        bufferingNewest: Int = 200,
+        events: Set<String>? = nil) -> AsyncStream<EventFrame>
+    {
         let id = UUID()
         let session = self
         return AsyncStream(bufferingPolicy: .bufferingNewest(bufferingNewest)) { continuation in
-            self.serverEventSubscribers[id] = continuation
+            self.serverEventSubscribers[id] = ServerEventSubscriber(
+                events: events,
+                continuation: continuation)
             continuation.onTermination = { @Sendable _ in
                 Task { await session.removeServerEventSubscriber(id) }
             }
@@ -448,9 +482,10 @@ public actor GatewayNodeSession {
             self.pluginSurfaceUrls = self.normalizePluginSurfaceUrls(ok.pluginsurfaceurls)
             self.serverCapabilities = Set(
                 GatewayServerCapability.allCases.filter { ok.supportsServerCapability($0) })
+            self.serverMethods = ok.advertisedServerMethods()
+            self.serverEvents = ok.advertisedServerEvents()
             if self.hasEverConnected {
-                self.broadcastServerEvent(
-                    EventFrame(type: "event", event: "seqGap", payload: nil, seq: nil, stateversion: nil))
+                self.broadcastSequenceGap()
             }
             self.hasEverConnected = true
             self.markSnapshotReceived()
@@ -461,8 +496,8 @@ public actor GatewayNodeSession {
                 evt,
                 channel: channel,
                 channelGeneration: channelGeneration)
-        default:
-            break
+        case .seqGap:
+            self.broadcastSequenceGap()
         }
     }
 
@@ -470,7 +505,13 @@ public actor GatewayNodeSession {
         self.hasNotifiedConnected = false
         self.snapshotReceived = false
         self.serverCapabilities = nil
+        self.serverMethods = nil
+        self.serverEvents = nil
         self.drainSnapshotWaiters(returning: false)
+    }
+
+    private func broadcastSequenceGap() {
+        self.broadcastServerEvent(Self.sequenceGapEvent)
     }
 
     private func handleChannelDisconnected(_ reason: String, channelGeneration: UInt64) async {
@@ -676,12 +717,34 @@ public actor GatewayNodeSession {
     }
 
     private func broadcastServerEvent(_ evt: EventFrame) {
-        for (id, continuation) in self.serverEventSubscribers {
-            if case .terminated = continuation.yield(evt) {
+        for (id, subscriber) in self.serverEventSubscribers {
+            if evt.event != "seqGap",
+               let events = subscriber.events,
+               !events.contains(evt.event)
+            {
+                continue
+            }
+            switch subscriber.continuation.yield(evt) {
+            case .dropped:
+                // A local buffer drop is equivalent to a wire sequence gap for stateful
+                // consumers: force their snapshot recovery instead of hiding data loss.
+                _ = subscriber.continuation.yield(Self.sequenceGapEvent)
+            case .terminated:
                 self.serverEventSubscribers.removeValue(forKey: id)
+            case .enqueued:
+                break
+            @unknown default:
+                _ = subscriber.continuation.yield(Self.sequenceGapEvent)
             }
         }
     }
+
+    private static let sequenceGapEvent = EventFrame(
+        type: "event",
+        event: "seqGap",
+        payload: nil,
+        seq: nil,
+        stateversion: nil)
 
     private func removeServerEventSubscriber(_ id: UUID) {
         self.serverEventSubscribers.removeValue(forKey: id)

@@ -5,9 +5,22 @@ public enum GatewayServerCapability: String, CaseIterable, Sendable {
 }
 
 extension HelloOk {
+    func advertisedServerMethods() -> Set<String> {
+        self.advertisedFeatureValues(for: "methods")
+    }
+
+    func advertisedServerEvents() -> Set<String> {
+        self.advertisedFeatureValues(for: "events")
+    }
+
     public func supportsServerCapability(_ capability: GatewayServerCapability) -> Bool {
         let values = features["capabilities"]?.value as? [AnyCodable] ?? []
         return values.contains { ($0.value as? String) == capability.rawValue }
+    }
+
+    private func advertisedFeatureValues(for key: String) -> Set<String> {
+        let values = self.features[key]?.value as? [AnyCodable] ?? []
+        return Set(values.compactMap { $0.value as? String })
     }
 }
 

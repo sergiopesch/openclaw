@@ -146,6 +146,10 @@ const loadHealthHandlers = lazyHandlerModule(
   () => import("./server-methods/health.js"),
   (module) => module.healthHandlers,
 );
+const loadInteractionSessionHandlers = lazyHandlerModule(
+  () => import("./server-methods/interaction-session.js"),
+  (module) => module.interactionSessionHandlers,
+);
 const loadLogsHandlers = lazyHandlerModule(
   () => import("./server-methods/logs.js"),
   (module) => module.logsHandlers,
@@ -338,6 +342,10 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
   ...createLazyCoreHandlers({
     methods: ["health", "status"],
     loadHandlers: loadHealthHandlers,
+  }),
+  ...createLazyCoreHandlers({
+    methods: ["interaction.session.get"],
+    loadHandlers: loadInteractionSessionHandlers,
   }),
   ...createLazyCoreHandlers({
     methods: ["channels.status", "channels.start", "channels.stop", "channels.logout"],

@@ -70,6 +70,22 @@ final class TalkModeManager: NSObject {
         self.gatewayConnected
     }
 
+    var activeRealtimeRelayRuntimeID: String? {
+        self.realtimeRelaySession?.activeRuntimeID
+    }
+
+    var interactionSessionKey: String {
+        self.activeInteractionSessionKey ?? self.mainSessionKey
+    }
+
+    var canTakeOverCanonicalRealtimeInteraction: Bool {
+        self.gatewayConnected && self.gatewayTalkUsesRealtimeRelay
+    }
+
+    var isCanonicalTakeoverInProgress: Bool {
+        self.canonicalTakeoverFailure != nil
+    }
+
     private enum CaptureMode {
         case idle
         case continuous
@@ -112,6 +128,10 @@ final class TalkModeManager: NSObject {
     private var realtimeRestartGeneration = 0
     private var realtimeRelaySession: RealtimeTalkRelaySession?
     private var realtimeRelayStartInFlight = false
+    private var pendingRealtimeRelaySessionKey: String?
+    private var canonicalTakeoverFailure: (@MainActor () -> Void)?
+    private var activeInteractionSessionKey: String?
+    private var interactionRuntimeStateChanged: (@MainActor () -> Void)?
     private var prefetchedRealtimeSession: TalkRealtimeClientSession?
     private var realtimePrefetchTask: Task<Void, Never>?
     private var realtimePrefetchGeneration: UInt64 = 0
@@ -320,6 +340,10 @@ final class TalkModeManager: NSObject {
         self.gateway = gateway
     }
 
+    func setInteractionRuntimeStateChangedHandler(_ handler: @escaping @MainActor () -> Void) {
+        self.interactionRuntimeStateChanged = handler
+    }
+
     func updateGatewayConnected(_ connected: Bool) {
         self.gatewayConnected = connected
         if connected {
@@ -384,6 +408,9 @@ final class TalkModeManager: NSObject {
     func setEnabled(_ enabled: Bool) {
         self.isEnabled = enabled
         if enabled {
+            if self.activeInteractionSessionKey == nil {
+                self.activeInteractionSessionKey = self.mainSessionKey
+            }
             self.logger.info("enabled")
             GatewayDiagnostics.log("talk.timeline manager enabled")
             Task { await self.start() }
@@ -394,12 +421,29 @@ final class TalkModeManager: NSObject {
         }
     }
 
+    func setEnabledForCanonicalTakeover(onFailure: @escaping @MainActor () -> Void) {
+        guard self.canTakeOverCanonicalRealtimeInteraction else {
+            onFailure()
+            return
+        }
+        self.canonicalTakeoverFailure = onFailure
+        self.setEnabled(true)
+    }
+
+    func ownsRealtimeRelayRuntime(_ runtimeID: String) -> Bool {
+        self.activeRealtimeRelayRuntimeID == runtimeID
+    }
+
+    func isPendingRealtimeRelayCreation(for sessionKey: String) -> Bool {
+        let requestedKey = sessionKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !requestedKey.isEmpty && self.pendingRealtimeRelaySessionKey == requestedKey
+    }
+
     func applyProviderSelectionChanged() {
         let shouldRestart = self.isEnabled
         if shouldRestart {
-            self.stop()
-            self.isEnabled = true
-            Task { await self.start() }
+            self.stop(releasingInteractionSession: false)
+            self.setEnabled(true)
         } else {
             Task { await self.reloadConfig() }
         }
@@ -421,6 +465,12 @@ final class TalkModeManager: NSObject {
     }
 
     func start() async {
+        defer {
+            if let onFailure = self.canonicalTakeoverFailure {
+                self.canonicalTakeoverFailure = nil
+                onFailure()
+            }
+        }
         GatewayDiagnostics.log(
             "talk.timeline manager start enter enabled=\(self.isEnabled) "
                 + "listening=\(self.isListening) gatewayConnected=\(self.gatewayConnected)")
@@ -477,12 +527,27 @@ final class TalkModeManager: NSObject {
                 ? await self.startRealtimeRelayIfAvailable()
                 : await self.startRealtimeIfAvailable()
             switch realtimeStart {
-            case .started, .ignored:
+            case .started:
+                self.canonicalTakeoverFailure = nil
+                return
+            case .ignored:
                 return
             case let .unavailable(issue):
                 self.pendingRealtimeIssue = issue
                 self.gatewayTalkLastIssueText = issue.diagnosticSummary
+                if !Self.allowsNativeFallback(
+                    canonicalTakeoverPending: self.canonicalTakeoverFailure != nil)
+                {
+                    self.statusText = "Move failed: \(issue.displayMessage)"
+                    return
+                }
             }
+        }
+        if !Self.allowsNativeFallback(
+            canonicalTakeoverPending: self.canonicalTakeoverFailure != nil)
+        {
+            self.statusText = "Move failed: Gateway relay unavailable"
+            return
         }
 
         let speechOk = await Self.requestSpeechPermission()
@@ -508,7 +573,7 @@ final class TalkModeManager: NSObject {
                 markNativeTalkActive()
             }
             self.startSilenceMonitor()
-            await self.subscribeChatIfNeeded(sessionKey: self.mainSessionKey)
+            await self.subscribeChatIfNeeded(sessionKey: self.interactionSessionKey)
             self.logger.info("listening")
         } catch {
             self.isListening = false
@@ -524,6 +589,10 @@ final class TalkModeManager: NSObject {
     private func cancelPendingStart() {
         self.startAttemptID += 1
         self.isStarting = false
+    }
+
+    private static func allowsNativeFallback(canonicalTakeoverPending: Bool) -> Bool {
+        !canonicalTakeoverPending
     }
 
     private var talkProviderSelection: TalkModeProviderSelection {
@@ -557,7 +626,13 @@ final class TalkModeManager: NSObject {
     }
 
     func stop() {
+        self.stop(releasingInteractionSession: true)
+    }
+
+    private func stop(releasingInteractionSession: Bool) {
+        self.canonicalTakeoverFailure = nil
         self.isEnabled = false
+        self.pendingRealtimeRelaySessionKey = nil
         self.cancelPendingStart()
         self.isListening = false
         self.isUserSpeechDetected = false
@@ -592,6 +667,9 @@ final class TalkModeManager: NSObject {
         }
         self.resumeContinuousAfterPTT = false
         self.activePTTCaptureId = nil
+        if releasingInteractionSession {
+            self.activeInteractionSessionKey = nil
+        }
         TalkSystemSpeechSynthesizer.shared.stop()
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
@@ -1145,7 +1223,7 @@ final class TalkModeManager: NSObject {
 
         do {
             let startedAt = Date().timeIntervalSince1970
-            let sessionKey = self.mainSessionKey
+            let sessionKey = self.interactionSessionKey
             await self.subscribeChatIfNeeded(sessionKey: sessionKey)
             self.logger.info(
                 "chat.send start sessionKey=\(sessionKey, privacy: .public) chars=\(prompt.count, privacy: .public)")
@@ -1260,10 +1338,10 @@ final class TalkModeManager: NSObject {
             await prefetchTask.value
         }
         let prefetchedSession = self.consumePrefetchedRealtimeSession()
-        GatewayDiagnostics.log("talk.timeline realtime start attempt sessionKey=\(self.mainSessionKey)")
+        GatewayDiagnostics.log("talk.timeline realtime start attempt sessionKey=\(self.interactionSessionKey)")
         let session = TalkRealtimeWebRTCSession(
             gateway: gateway,
-            sessionKey: mainSessionKey,
+            sessionKey: self.interactionSessionKey,
             delegate: self)
         self.realtimeSession = session
         do {
@@ -1317,14 +1395,22 @@ final class TalkModeManager: NSObject {
             return .ignored
         }
         self.realtimeRelayStartInFlight = true
-        defer { self.realtimeRelayStartInFlight = false }
+        let boundSessionKey = self.interactionSessionKey
+        self.pendingRealtimeRelaySessionKey = boundSessionKey
+        defer {
+            self.realtimeRelayStartInFlight = false
+            if self.pendingRealtimeRelaySessionKey == boundSessionKey {
+                self.pendingRealtimeRelaySessionKey = nil
+            }
+            self.interactionRuntimeStateChanged?()
+        }
         prepareRealtimeRelayStart()
-        GatewayDiagnostics.log("talk.timeline realtime relay start attempt sessionKey=\(self.mainSessionKey)")
+        GatewayDiagnostics.log("talk.timeline realtime relay start attempt sessionKey=\(boundSessionKey)")
         let startedAt = Self.nowSeconds()
         let relaySession = RealtimeTalkRelaySession(
             gateway: gateway,
             options: RealtimeTalkRelaySession.Options(
-                sessionKey: self.mainSessionKey,
+                sessionKey: boundSessionKey,
                 provider: self.realtimeProvider,
                 model: self.realtimeModelId,
                 voice: self.realtimeVoiceId),
@@ -1340,6 +1426,9 @@ final class TalkModeManager: NSObject {
                 self.gatewayTalkLastIssueText = issue.diagnosticSummary
                 self.gatewayTalkActiveModeTitle = "Realtime unavailable"
                 self.gatewayTalkActiveModeSubtitle = issue.displayMessage
+            },
+            onRuntimeIDChanged: { [weak self] in
+                self?.interactionRuntimeStateChanged?()
             },
             onSpeakingChanged: { [weak self] speaking in
                 guard let self else { return }
@@ -1543,7 +1632,7 @@ final class TalkModeManager: NSObject {
 
     private func sendChat(_ message: String, gateway: GatewayNodeSession) async throws -> OpenClawChatSendResponse {
         let payload: [String: Any] = [
-            "sessionKey": mainSessionKey,
+            "sessionKey": self.interactionSessionKey,
             "message": message,
             "thinking": "low",
             "timeoutMs": 30000,
@@ -1652,7 +1741,7 @@ final class TalkModeManager: NSObject {
     private func fetchLatestAssistantText(gateway: GatewayNodeSession, since: Double? = nil) async throws -> String? {
         let res = try await gateway.request(
             method: "chat.history",
-            paramsJSON: "{\"sessionKey\":\"\(self.mainSessionKey)\"}",
+            paramsJSON: "{\"sessionKey\":\"\(self.interactionSessionKey)\"}",
             timeoutSeconds: 15)
         guard let json = try JSONSerialization.jsonObject(with: res) as? [String: Any] else { return nil }
         guard let messages = json["messages"] as? [[String: Any]] else { return nil }
@@ -3335,6 +3424,10 @@ extension TalkModeManager {
         self.realtimeRestartDelayNanoseconds(attempt: attempt)
     }
 
+    static func _test_allowsNativeFallback(canonicalTakeoverPending: Bool) -> Bool {
+        self.allowsNativeFallback(canonicalTakeoverPending: canonicalTakeoverPending)
+    }
+
     static func _test_isPCMFormatRejectedByAPI(_ error: Error?) -> Bool {
         self.isPCMFormatRejectedByAPI(error)
     }
@@ -3404,11 +3497,38 @@ extension TalkModeManager {
         self.handleRealtimeRelayStatus(status)
     }
 
-    func _test_prepareEnabledRealtimeSessionForClose() {
+    func _test_prepareEnabledRealtimeSessionForClose(
+        relaySession: RealtimeTalkRelaySession? = nil)
+    {
+        self.realtimeRelaySession = relaySession
         self.isEnabled = true
+        self.activeInteractionSessionKey = self.mainSessionKey
         self.gatewayConnected = true
         self.captureMode = .idle
         self.realtimeSessionReadyAt = nil
+    }
+
+    func _test_preparePendingRealtimeRelayCreation(sessionKey: String) {
+        self.mainSessionKey = sessionKey
+        self.activeInteractionSessionKey = sessionKey
+        self.pendingRealtimeRelaySessionKey = sessionKey
+        self.isEnabled = true
+    }
+
+    func _test_resolvePendingRealtimeRelayCreation(
+        relaySession: RealtimeTalkRelaySession?)
+    {
+        self.realtimeRelaySession = relaySession
+        self.pendingRealtimeRelaySessionKey = nil
+        self.interactionRuntimeStateChanged?()
+    }
+
+    func _test_setCanonicalTakeoverInProgress(_ inProgress: Bool) {
+        if inProgress {
+            self.canonicalTakeoverFailure = {}
+        } else {
+            self.canonicalTakeoverFailure = nil
+        }
     }
 
     func _test_rapidRealtimeRestartCount() -> Int {

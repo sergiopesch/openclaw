@@ -9,6 +9,7 @@ import {
 } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { sha256Base64Url } from "../infra/crypto-digest.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { recordTalkObservabilityEvent } from "../talk/observability.js";
 import {
   createTalkSessionController,
@@ -19,9 +20,16 @@ import {
   type TalkSessionController,
   type TalkTransport,
 } from "../talk/talk-session-controller.js";
+import {
+  bindGatewayInteractionRuntime,
+  type InteractionSessionBindingProjection,
+  type GatewayInteractionRuntimeBinding,
+} from "./interaction-session-actor.js";
+import { forgetUnifiedTalkSession, rememberUnifiedTalkSession } from "./talk-session-registry.js";
 
 const DEFAULT_TALK_HANDOFF_TTL_MS = 10 * 60 * 1000;
 const MAX_TALK_HANDOFF_TTL_MS = 60 * 60 * 1000;
+const log = createSubsystemLogger("gateway/talk-handoff");
 
 /** Inputs captured when a gateway caller creates a managed Talk room. */
 export type TalkHandoffCreateParams = {
@@ -36,6 +44,13 @@ export type TalkHandoffCreateParams = {
   transport?: TalkTransport;
   brain?: TalkBrain;
   ttlMs?: number;
+  onInteractionEvents?: (params: {
+    activeClientId?: string;
+    events: TalkEvent[];
+    handoffId: string;
+    roomId: string;
+  }) => void;
+  onInteractionProjection?: (projection: InteractionSessionBindingProjection) => void;
 };
 
 /** Private handoff state, including the hashed room token and event controller. */
@@ -56,11 +71,17 @@ export type TalkHandoffRecord = {
   brain: TalkBrain;
   createdAt: number;
   expiresAt: number;
+  cleanupTimer: ReturnType<typeof setTimeout>;
   room: TalkHandoffRoomState;
+  interaction?: GatewayInteractionRuntimeBinding;
+  onInteractionEvents?: TalkHandoffCreateParams["onInteractionEvents"];
 };
 
 /** Public handoff shape returned to clients; never includes token material. */
-export type TalkHandoffPublicRecord = Omit<TalkHandoffRecord, "tokenHash" | "room"> & {
+export type TalkHandoffPublicRecord = Omit<
+  TalkHandoffRecord,
+  "cleanupTimer" | "interaction" | "onInteractionEvents" | "tokenHash" | "room"
+> & {
   room: {
     activeClientId?: string;
     activeTurnId?: string;
@@ -126,6 +147,18 @@ export function createTalkHandoff(params: TalkHandoffCreateParams): TalkHandoffC
     brain: params.brain ?? "agent-consult",
     provider: params.provider,
   });
+  const cleanupDelayMs = expiresAt > createdAt ? expiresAt - createdAt : 0;
+  const cleanupTimer = setTimeout(() => {
+    const active = handoffs.get(id);
+    if (active) {
+      closeTalkHandoffRecord(active, {
+        eventType: "session.closed",
+        reason: "expired",
+        notify: true,
+      });
+    }
+  }, cleanupDelayMs);
+  cleanupTimer.unref?.();
   const record: TalkHandoffRecord = {
     id,
     roomId,
@@ -143,13 +176,45 @@ export function createTalkHandoff(params: TalkHandoffCreateParams): TalkHandoffC
     brain: params.brain ?? "agent-consult",
     createdAt,
     expiresAt,
+    cleanupTimer,
     room,
+    onInteractionEvents: params.onInteractionEvents,
   };
   appendTalkHandoffRoomEvent(record, {
     type: "session.started",
     payload: { handoffId: id, roomId },
   });
   handoffs.set(id, record);
+  rememberUnifiedTalkSession(id, {
+    kind: "managed-room",
+    handoffId: id,
+    token,
+    roomId,
+  });
+  try {
+    record.interaction = bindGatewayInteractionRuntime({
+      sessionKey: params.sessionKey,
+      runtimeId: id,
+      runtimeKind: "managed-room",
+      onProjection: params.onInteractionProjection,
+      onRevoked: ({ reason }) => {
+        const active = handoffs.get(id);
+        if (!active) {
+          return;
+        }
+        closeTalkHandoffRecord(active, {
+          eventType: reason === "runtime_replaced" ? "session.replaced" : "session.closed",
+          reason,
+          notify: true,
+        });
+      },
+    });
+  } catch (error) {
+    handoffs.delete(id);
+    forgetUnifiedTalkSession(id);
+    clearTimeout(cleanupTimer);
+    throw error;
+  }
   return { ...toPublicTalkHandoffRecord(record), token };
 }
 
@@ -276,17 +341,16 @@ export function revokeTalkHandoff(id: string): TalkHandoffRevokeResult {
   if (!record) {
     return { revoked: false, events: [] };
   }
-  const event = appendTalkHandoffRoomEvent(record, {
-    type: "session.closed",
-    payload: { reason: "revoked", handoffId: id, roomId: record.roomId },
-    final: true,
+  const event = closeTalkHandoffRecord(record, {
+    eventType: "session.closed",
+    reason: "revoked",
+    notify: false,
   });
-  handoffs.delete(id);
   return {
     revoked: true,
     roomId: record.roomId,
     activeClientId: record.room.activeClientId,
-    events: [event],
+    events: event ? [event] : [],
   };
 }
 
@@ -297,6 +361,11 @@ export function verifyTalkHandoffToken(record: TalkHandoffRecord, token: string)
 
 /** Clears process-local handoffs between tests. */
 export function clearTalkHandoffsForTest(): void {
+  for (const record of handoffs.values()) {
+    clearTimeout(record.cleanupTimer);
+    forgetUnifiedTalkSession(record.id);
+    record.interaction?.release();
+  }
   handoffs.clear();
 }
 
@@ -312,14 +381,13 @@ function pruneExpiredTalkHandoffs(now = Date.now()): void {
   if (validNow === undefined) {
     return;
   }
-  for (const [id, record] of handoffs) {
+  for (const record of handoffs.values()) {
     if (!isFutureDateTimestampMs(record.expiresAt, { nowMs: validNow })) {
-      appendTalkHandoffRoomEvent(record, {
-        type: "session.closed",
-        payload: { reason: "expired", handoffId: id, roomId: record.roomId },
-        final: true,
+      closeTalkHandoffRecord(record, {
+        eventType: "session.closed",
+        reason: "expired",
+        notify: true,
       });
-      handoffs.delete(id);
     }
   }
 }
@@ -329,7 +397,14 @@ function hashTalkHandoffToken(token: string): string {
 }
 
 function toPublicTalkHandoffRecord(record: TalkHandoffRecord): TalkHandoffPublicRecord {
-  const { tokenHash: _tokenHash, room: _room, ...publicRecord } = record;
+  const {
+    cleanupTimer: _cleanupTimer,
+    interaction: _interaction,
+    onInteractionEvents: _onInteractionEvents,
+    tokenHash: _tokenHash,
+    room: _room,
+    ...publicRecord
+  } = record;
   return {
     ...publicRecord,
     room: {
@@ -374,18 +449,60 @@ function resolveTalkHandoffAccess(
   if (!isFutureDateTimestampMs(record.expiresAt)) {
     // Expiry emits the same close event as explicit revocation so room clients
     // can reconcile state without knowing which cleanup path won the race.
-    appendTalkHandoffRoomEvent(record, {
-      type: "session.closed",
-      payload: { reason: "expired", handoffId: id, roomId: record.roomId },
-      final: true,
+    closeTalkHandoffRecord(record, {
+      eventType: "session.closed",
+      reason: "expired",
+      notify: true,
     });
-    handoffs.delete(id);
     return { ok: false, reason: "expired" };
   }
   if (!verifyTalkHandoffToken(record, token)) {
     return { ok: false, reason: "invalid_token" };
   }
   return { ok: true, record };
+}
+
+function closeTalkHandoffRecord(
+  record: TalkHandoffRecord,
+  params: {
+    eventType: "session.closed" | "session.replaced";
+    reason: string;
+    notify: boolean;
+  },
+): TalkEvent | undefined {
+  if (handoffs.get(record.id) !== record) {
+    return undefined;
+  }
+  handoffs.delete(record.id);
+  clearTimeout(record.cleanupTimer);
+  forgetUnifiedTalkSession(record.id);
+  record.interaction?.release();
+  const event = appendTalkHandoffRoomEvent(record, {
+    type: params.eventType,
+    payload: { reason: params.reason, handoffId: record.id, roomId: record.roomId },
+    final: true,
+  });
+  if (params.notify) {
+    try {
+      record.onInteractionEvents?.({
+        activeClientId: record.room.activeClientId,
+        events: [event],
+        handoffId: record.id,
+        roomId: record.roomId,
+      });
+    } catch (error) {
+      logCleanupFailure(record.id, "terminal event delivery", error);
+    }
+  }
+  return event;
+}
+
+function logCleanupFailure(handoffId: string, operation: string, error: unknown): void {
+  try {
+    log.warn(`managed-room ${operation} failed for ${handoffId}: ${String(error)}`);
+  } catch {
+    // Cleanup remains no-throw even when the logging sink is unavailable.
+  }
 }
 
 function appendTalkHandoffRoomEvent(record: TalkHandoffRecord, input: TalkEventInput): TalkEvent {

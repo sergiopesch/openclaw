@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { normalizeResolvedSecretInputString } from "../../config/types.secrets.js";
+import { rememberUnifiedTalkSession } from "../talk-session-registry.js";
 import { buildTalkRealtimeConfig } from "./talk-shared.js";
 import { talkHandlers } from "./talk.js";
 
@@ -1426,6 +1427,11 @@ describe("talk.session unified handlers", () => {
       voice: "alloy",
       expiresAt: 1_797_986_400,
     });
+    rememberUnifiedTalkSession("relay-unified-1", {
+      kind: "realtime-relay",
+      connId: "conn-1",
+      relaySessionId: "relay-unified-1",
+    });
 
     const createRespond = vi.fn();
     await talkHandlers["talk.session.create"]({
@@ -1470,7 +1476,11 @@ describe("talk.session unified handlers", () => {
       string,
       unknown
     >;
-    expectRecordFields(relayCreateInput, { connId: "conn-1", provider });
+    expectRecordFields(relayCreateInput, {
+      connId: "conn-1",
+      provider,
+      sessionKey: "agent:main:main",
+    });
     expectRecordFields(relayCreateInput.providerConfig, {
       apiKey: "openai-key",
       model: "gpt-realtime",
@@ -1659,6 +1669,11 @@ describe("talk.session unified handlers", () => {
       audio: { inputEncoding: "g711_ulaw", inputSampleRateHz: 8000 },
       expiresAt: 1_797_986_400,
     });
+    rememberUnifiedTalkSession("stt-unified-1", {
+      kind: "transcription-relay",
+      connId: "conn-1",
+      transcriptionSessionId: "stt-unified-1",
+    });
 
     const createRespond = vi.fn();
     await talkHandlers["talk.session.create"]({
@@ -1702,6 +1717,7 @@ describe("talk.session unified handlers", () => {
       string,
       unknown
     >;
+    expect(createInput.sessionKey).toBe("agent:main:main");
     expectRecordFields(createInput.providerConfig, {
       apiKey: "stt-key",
       model: "gpt-4o-mini-transcribe",

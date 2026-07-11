@@ -1,7 +1,8 @@
 /**
  * Tests talk handoff coordination between gateway sessions and realtime state.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getGatewayInteractionSessionProjection } from "./interaction-session-actor.js";
 import {
   cancelTalkHandoffTurn,
   clearTalkHandoffsForTest,
@@ -13,6 +14,7 @@ import {
   startTalkHandoffTurn,
   verifyTalkHandoffToken,
 } from "./talk-handoff.js";
+import { getUnifiedTalkSession } from "./talk-session-registry.js";
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -57,6 +59,11 @@ function expectEventFields(
 }
 
 describe("talk handoff store", () => {
+  afterEach(() => {
+    clearTalkHandoffsForTest();
+    vi.useRealTimers();
+  });
+
   it("creates an expiring managed-room handoff without storing the plaintext token", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-05-05T12:00:00.000Z"));
@@ -108,6 +115,42 @@ describe("talk handoff store", () => {
     vi.advanceTimersByTime(5001);
     expect(getTalkHandoff(handoff.id)).toBeUndefined();
     vi.useRealTimers();
+  });
+
+  it("expires a managed room from its lifecycle timer exactly once", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-05T12:00:00.000Z"));
+    const projections: Array<{ state: string }> = [];
+    const terminalEvents: unknown[] = [];
+    const handoff = createTalkHandoff({
+      sessionKey: "agent:main:main",
+      ttlMs: 1000,
+      onInteractionProjection: (projection) => projections.push(projection),
+      onInteractionEvents: (event) => {
+        terminalEvents.push(event);
+        throw new Error("delivery failed");
+      },
+    });
+    const timer = getTalkHandoff(handoff.id)?.cleanupTimer;
+
+    expect(timer?.hasRef?.()).toBe(false);
+    expect(getGatewayInteractionSessionProjection("agent:main:main")?.runtimeId).toBe(handoff.id);
+
+    expect(() => vi.advanceTimersByTime(1000)).not.toThrow();
+
+    expect(() => getUnifiedTalkSession(handoff.id)).toThrow("Unknown Talk session");
+    expect(getGatewayInteractionSessionProjection("agent:main:main")).toBeUndefined();
+    expect(projections.map((projection) => projection.state)).toEqual(["active", "closed"]);
+    expect(terminalEvents).toHaveLength(1);
+    expectFields(
+      requireArray(requireRecord(terminalEvents[0], "terminal notification").events)[0],
+      "terminal event",
+      { type: "session.closed", final: true },
+    );
+
+    vi.advanceTimersByTime(5000);
+    expect(projections.map((projection) => projection.state)).toEqual(["active", "closed"]);
+    expect(terminalEvents).toHaveLength(1);
   });
 
   it("expires handoffs immediately when the creation clock is invalid", () => {
@@ -227,6 +270,37 @@ describe("talk handoff store", () => {
       final: true,
     });
     expect(requireRecord(closed.payload, "closed payload").reason).toBe("revoked");
+  });
+
+  it("replaces a managed-room runtime bound to the same canonical session", () => {
+    clearTalkHandoffsForTest();
+    const interactionEvents = vi.fn();
+    const first = createTalkHandoff({
+      sessionKey: "agent:main:main",
+      onInteractionEvents: interactionEvents,
+    });
+    const joined = joinTalkHandoff(first.id, first.token, { clientId: "conn-1" });
+    expect(joined.ok).toBe(true);
+    const second = createTalkHandoff({ sessionKey: "agent:main:main" });
+
+    expect(getTalkHandoff(first.id)).toBeUndefined();
+    expect(() => getUnifiedTalkSession(first.id)).toThrow("Unknown Talk session");
+    expect(getTalkHandoff(second.id)?.id).toBe(second.id);
+    expect(interactionEvents).toHaveBeenCalledOnce();
+    const notification = expectFields(
+      interactionEvents.mock.calls[0]?.[0],
+      "interaction replacement",
+      {
+        activeClientId: "conn-1",
+        handoffId: first.id,
+        roomId: first.roomId,
+      },
+    );
+    const events = requireArray(notification.events, "interaction replacement events");
+    expectEventFields(events, 0, {
+      type: "session.replaced",
+      final: true,
+    });
   });
 
   it("records managed-room turn start, end, and cancellation events", () => {

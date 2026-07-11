@@ -17,12 +17,16 @@ import {
   validateTalkSessionSubmitToolResultParams,
   validateTalkSessionTurnParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { resolveMainSessionKey } from "../../config/sessions.js";
+import type { OpenClawConfig } from "../../config/types.js";
 import { REALTIME_VOICE_AGENT_CONSULT_TOOL } from "../../talk/agent-consult-tool.js";
 import { REALTIME_VOICE_AGENT_CONTROL_TOOL } from "../../talk/agent-run-control-shared.js";
 import { controlRealtimeVoiceAgentRun } from "../../talk/agent-run-control.js";
 import { resolveConfiguredRealtimeVoiceProvider } from "../../talk/provider-resolver.js";
 import type { TalkBrain, TalkMode, TalkTransport } from "../../talk/talk-events.js";
+import { broadcastInteractionSessionProjection } from "../interaction-session-events.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
+import { resolveSessionStoreKey } from "../session-store-key.js";
 import { resolveSessionKeyFromResolveParams } from "../sessions-resolve.js";
 import {
   cancelTalkHandoffTurn,
@@ -45,7 +49,6 @@ import {
 import {
   forgetUnifiedTalkSession,
   getUnifiedTalkSession,
-  rememberUnifiedTalkSession,
   requireUnifiedTalkSessionConn,
   type UnifiedTalkSessionRecord,
 } from "../talk-session-registry.js";
@@ -105,6 +108,14 @@ function normalizeTalkSessionBrain(params: { mode: TalkMode; brain?: string }): 
     return brain;
   }
   return params.mode === "transcription" ? "none" : "agent-consult";
+}
+
+function resolveTalkInteractionSessionKey(
+  cfg: OpenClawConfig,
+  requestedSessionKey: string | undefined,
+): string {
+  const sessionKey = normalizeOptionalString(requestedSessionKey) ?? resolveMainSessionKey(cfg);
+  return resolveSessionStoreKey({ cfg, sessionKey });
 }
 
 function isActiveManagedRoomClient(
@@ -270,12 +281,15 @@ export const talkSessionHandlers: GatewayRequestHandlers = {
           transport,
           brain,
           ttlMs: params.ttlMs,
-        });
-        rememberUnifiedTalkSession(handoff.id, {
-          kind: "managed-room",
-          handoffId: handoff.id,
-          token: handoff.token,
-          roomId: handoff.roomId,
+          onInteractionEvents: ({ activeClientId, events, handoffId, roomId }) => {
+            broadcastTalkRoomEvents(context, activeClientId, {
+              handoffId,
+              roomId,
+              events,
+            });
+          },
+          onInteractionProjection: (projection) =>
+            broadcastInteractionSessionProjection(context, projection),
         });
         respondOk(respond, {
           sessionId: handoff.id,
@@ -322,6 +336,7 @@ export const talkSessionHandlers: GatewayRequestHandlers = {
           requested: params,
           defaults: realtimeConfig,
         });
+        const sessionKey = resolveTalkInteractionSessionKey(runtimeConfig, params.sessionKey);
         const session = createTalkRealtimeRelaySession({
           context,
           connId,
@@ -331,15 +346,10 @@ export const talkSessionHandlers: GatewayRequestHandlers = {
           instructions: buildRealtimeInstructions(realtimeConfig.instructions),
           tools: [REALTIME_VOICE_AGENT_CONSULT_TOOL, REALTIME_VOICE_AGENT_CONTROL_TOOL],
           model: launchOptions.model,
-          sessionKey: normalizeOptionalString(params.sessionKey),
+          sessionKey,
           voice: launchOptions.voice,
           forceAgentConsultOnFinalTranscript:
             realtimeConfig.consultRouting === "force-agent-consult",
-        });
-        rememberUnifiedTalkSession(session.relaySessionId, {
-          kind: "realtime-relay",
-          connId,
-          relaySessionId: session.relaySessionId,
         });
         respondOk(respond, {
           ...session,
@@ -371,11 +381,7 @@ export const talkSessionHandlers: GatewayRequestHandlers = {
           connId,
           provider: resolution.provider,
           providerConfig: resolution.providerConfig,
-        });
-        rememberUnifiedTalkSession(session.transcriptionSessionId, {
-          kind: "transcription-relay",
-          connId,
-          transcriptionSessionId: session.transcriptionSessionId,
+          sessionKey: resolveTalkInteractionSessionKey(runtimeConfig, params.sessionKey),
         });
         respondOk(respond, {
           ...session,

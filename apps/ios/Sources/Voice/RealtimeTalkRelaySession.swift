@@ -124,7 +124,9 @@ final class RealtimeTalkRelaySession {
     private let logger = Logger(subsystem: "ai.openclawfoundation.app", category: "RealtimeTalkRelay")
     private let onStatus: (String) -> Void
     private let onIssue: (TalkRuntimeIssue) -> Void
+    private let onRuntimeIDChanged: () -> Void
     private let onSpeakingChanged: (Bool) -> Void
+    private let closeRelaySession: @MainActor (String) async -> Void
 
     private let audioEngine = AVAudioEngine()
     private var relaySessionId: String?
@@ -159,12 +161,18 @@ final class RealtimeTalkRelaySession {
     private var outputAudioChunkCount = 0
     private var outputAudioByteCount = 0
 
+    var activeRuntimeID: String? {
+        self.relaySessionId
+    }
+
     init(
         gateway: GatewayNodeSession,
         options: Options,
         pcmPlayer: PCMStreamingAudioPlaying,
         onStatus: @escaping (String) -> Void,
         onIssue: @escaping (TalkRuntimeIssue) -> Void = { _ in },
+        onRuntimeIDChanged: @escaping () -> Void = {},
+        closeRelaySession: (@MainActor (String) async -> Void)? = nil,
         onSpeakingChanged: @escaping (Bool) -> Void)
     {
         self.gateway = gateway
@@ -172,6 +180,10 @@ final class RealtimeTalkRelaySession {
         self.pcmPlayer = pcmPlayer
         self.onStatus = onStatus
         self.onIssue = onIssue
+        self.onRuntimeIDChanged = onRuntimeIDChanged
+        self.closeRelaySession = closeRelaySession ?? { [gateway] relaySessionID in
+            await Self.closeRelaySession(gateway: gateway, relaySessionId: relaySessionID)
+        }
         self.onSpeakingChanged = onSpeakingChanged
     }
 
@@ -194,8 +206,7 @@ final class RealtimeTalkRelaySession {
                     NSLocalizedDescriptionKey: "Gateway did not return a realtime relay session",
                 ])
             }
-            self.relaySessionId = relaySessionId
-            self.audioSender = RealtimeAudioSender(gateway: self.gateway, relaySessionId: relaySessionId)
+            guard await self.adoptCreatedRelaySessionID(relaySessionId) else { return }
             self.configureAudioContract(result.audio)
             try self.startMicrophonePump()
             self.onStatus("Waiting for realtime…")
@@ -215,7 +226,7 @@ final class RealtimeTalkRelaySession {
             let createdRelaySessionId = self.relaySessionId
             self.close(sendClose: false)
             if let createdRelaySessionId {
-                await Self.closeRelaySession(gateway: self.gateway, relaySessionId: createdRelaySessionId)
+                await self.closeRelaySession(createdRelaySessionId)
             }
             throw error
         }
@@ -237,12 +248,27 @@ final class RealtimeTalkRelaySession {
         Task { await audioSender?.close() }
         self.stopOutputPlayback()
         if sendClose, let relaySessionId = self.relaySessionId {
-            Task { [gateway] in
-                await Self.closeRelaySession(gateway: gateway, relaySessionId: relaySessionId)
+            let closeRelaySession = self.closeRelaySession
+            Task {
+                await closeRelaySession(relaySessionId)
             }
         }
         self.relaySessionId = nil
+        self.onRuntimeIDChanged()
         self.onSpeakingChanged(false)
+    }
+
+    private func adoptCreatedRelaySessionID(_ relaySessionID: String) async -> Bool {
+        guard !self.isClosed else {
+            await self.closeRelaySession(relaySessionID)
+            return false
+        }
+        self.relaySessionId = relaySessionID
+        self.audioSender = RealtimeAudioSender(
+            gateway: self.gateway,
+            relaySessionId: relaySessionID)
+        self.onRuntimeIDChanged()
+        return true
     }
 
     private nonisolated static func closeRelaySession(
@@ -936,6 +962,11 @@ final class RealtimeTalkRelaySession {
 extension RealtimeTalkRelaySession {
     func _test_setRelaySessionId(_ relaySessionId: String) {
         self.relaySessionId = relaySessionId
+        self.onRuntimeIDChanged()
+    }
+
+    func _test_adoptCreatedRelaySessionID(_ relaySessionID: String) async -> Bool {
+        await self.adoptCreatedRelaySessionID(relaySessionID)
     }
 
     func _test_handleGatewayEvent(_ event: EventFrame) async {

@@ -452,6 +452,26 @@ describe("gateway broadcaster", () => {
     expectSentEvents(adminSocket, ["task"]);
   });
 
+  it("requires operator.read for global interaction-session events", () => {
+    const { pairingSocket, nodeSocket, readSocket, writeSocket, adminSocket, broadcast } =
+      makeScopedBroadcastContext();
+
+    broadcast("interaction.session.changed", {
+      interactionSessionId: "interaction-1",
+      sessionKey: "agent:main:main",
+      epoch: 1,
+      runtimeId: "relay-1",
+      runtimeKind: "realtime-voice",
+      state: "active",
+    });
+
+    expect(pairingSocket.send).not.toHaveBeenCalled();
+    expect(nodeSocket.send).not.toHaveBeenCalled();
+    expectSentEvents(readSocket, ["interaction.session.changed"]);
+    expectSentEvents(writeSocket, ["interaction.session.changed"]);
+    expectSentEvents(adminSocket, ["interaction.session.changed"]);
+  });
+
   it("allows plugin.* broadcast events for operator.write and operator.admin", () => {
     const { pairingSocket, nodeSocket, readSocket, writeSocket, adminSocket, broadcast } =
       makeScopedBroadcastContext();

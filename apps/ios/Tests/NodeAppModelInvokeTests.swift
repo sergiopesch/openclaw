@@ -396,14 +396,160 @@ private func overrideNotificationServingPreference(_ enabled: Bool) -> () -> Voi
         #expect(appModel.chatDeliveryAgentId == "agent-c")
     }
 
-    @Test @MainActor func `init preserves saved talk mode preference`() {
+    @Test @MainActor func `saved talk intent waits for config and current ownership`() {
         withUserDefaults(["talk.enabled": true]) {
             let talkMode = TalkModeManager(allowSimulatorCapture: true)
             let appModel = NodeAppModel(talkMode: talkMode)
 
             #expect(UserDefaults.standard.bool(forKey: "talk.enabled"))
-            #expect(appModel.talkMode.isEnabled)
+            #expect(!appModel.talkMode.isEnabled)
+
+            talkMode.gatewayTalkConfigLoaded = true
+            appModel._test_reconcilePersistedTalkIntentIfReady()
+            #expect(UserDefaults.standard.bool(forKey: "talk.enabled"))
+            #expect(!talkMode.isEnabled)
+
+            let generation = appModel.interactionSessions.beginSnapshot(for: "main")
+            appModel.interactionSessions.completeSnapshot(
+                nil,
+                for: "main",
+                canonicalSessionKey: "main",
+                generation: generation)
+            appModel._test_reconcilePersistedTalkIntentIfReady()
+
+            #expect(UserDefaults.standard.bool(forKey: "talk.enabled"))
+            #expect(talkMode.isEnabled)
+            appModel.setTalkEnabled(false)
         }
+    }
+
+    @Test @MainActor func `saved talk intent clears only after current remote ownership blocks it`() {
+        withUserDefaults(["talk.enabled": true]) {
+            let talkMode = TalkModeManager(allowSimulatorCapture: true)
+            let appModel = NodeAppModel(talkMode: talkMode)
+            talkMode.gatewayTalkConfigLoaded = true
+            let generation = appModel.interactionSessions.beginSnapshot(for: "main")
+            appModel.interactionSessions.completeSnapshot(
+                InteractionSessionActiveProjection(
+                    interactionsessionid: "interaction-remote",
+                    sessionkey: "main",
+                    epoch: 1,
+                    runtimeid: "remote-relay",
+                    runtimekind: .realtimeVoice,
+                    state: "active"),
+                for: "main",
+                canonicalSessionKey: "main",
+                generation: generation)
+
+            appModel._test_reconcilePersistedTalkIntentIfReady()
+
+            #expect(!UserDefaults.standard.bool(forKey: "talk.enabled"))
+            #expect(!talkMode.isEnabled)
+            #expect(talkMode.statusText == "Active on another device")
+        }
+    }
+
+    @Test @MainActor func `persisted routing change requests snapshot for effective key`() {
+        let appModel = NodeAppModel()
+        var requestedKeys: [String] = []
+        appModel._test_setInteractionSnapshotRequestHandler { requestedKeys.append($0) }
+        let generation = appModel.interactionSessions.beginSnapshot(for: "main")
+        appModel.interactionSessions.completeSnapshot(
+            nil,
+            for: "main",
+            canonicalSessionKey: "main",
+            generation: generation)
+
+        appModel._test_applyPersistedChatRoutingIdentity(
+            mainSessionKey: "primary",
+            defaultAgentID: "main",
+            selectedAgentID: "ops")
+
+        #expect(appModel.chatSessionKey == "agent:ops:primary")
+        #expect(requestedKeys == ["agent:ops:primary"])
+    }
+
+    @Test @MainActor func `agent metadata default and main key change requests final snapshot`() {
+        let appModel = NodeAppModel()
+        appModel.setSelectedAgentId("ops")
+        let initialKey = appModel.chatSessionKey
+        let generation = appModel.interactionSessions.beginSnapshot(for: initialKey)
+        appModel.interactionSessions.completeSnapshot(
+            nil,
+            for: initialKey,
+            canonicalSessionKey: initialKey,
+            generation: generation)
+        var requestedKeys: [String] = []
+        appModel._test_setInteractionSnapshotRequestHandler { requestedKeys.append($0) }
+        let opsAgent = AgentSummary(
+            id: "ops",
+            name: "Ops",
+            identity: nil,
+            workspace: nil,
+            workspacegit: nil,
+            model: nil,
+            agentruntime: nil)
+
+        appModel._test_applyGatewayAgentRoutingMetadata(
+            mainSessionKey: "primary",
+            defaultAgentID: "ops",
+            agents: [opsAgent])
+
+        #expect(appModel.chatSessionKey == "primary")
+        #expect(requestedKeys == ["primary"])
+    }
+
+    @Test @MainActor func `main key refresh requests snapshot for new key`() {
+        let appModel = NodeAppModel()
+        var requestedKeys: [String] = []
+        appModel._test_setInteractionSnapshotRequestHandler { requestedKeys.append($0) }
+        let generation = appModel.interactionSessions.beginSnapshot(for: "main")
+        appModel.interactionSessions.completeSnapshot(
+            nil,
+            for: "main",
+            canonicalSessionKey: "main",
+            generation: generation)
+
+        appModel._test_applyMainSessionKey("primary")
+
+        #expect(appModel.chatSessionKey == "primary")
+        #expect(requestedKeys == ["primary"])
+    }
+
+    @Test @MainActor func `malformed interaction projection marks stale and requests recovery`() async {
+        let appModel = NodeAppModel(talkMode: TalkModeManager(allowSimulatorCapture: true))
+        let generation = appModel.interactionSessions.beginSnapshot(for: "main")
+        appModel.interactionSessions.completeSnapshot(
+            nil,
+            for: "main",
+            canonicalSessionKey: "main",
+            generation: generation)
+        var recoveryKeys: [String] = []
+
+        await appModel._test_handleInteractionSessionChangedPayload(
+            AnyCodable(["state": "invalid"]))
+        { sessionKey in
+            recoveryKeys.append(sessionKey)
+        }
+
+        #expect(appModel.interactionSessions.availability == .stale)
+        #expect(recoveryKeys == ["main"])
+    }
+
+    @Test @MainActor func `stale recovery refreshes distinct focused and pinned talk keys`() async {
+        let talkMode = TalkModeManager(allowSimulatorCapture: true)
+        let appModel = NodeAppModel(talkMode: talkMode)
+        talkMode._test_preparePendingRealtimeRelayCreation(sessionKey: "talk-session")
+        appModel.focusChatSession("chat-session")
+        var recoveryKeys: [String] = []
+
+        await appModel._test_recoverStaleInteractionSessions { sessionKey in
+            recoveryKeys.append(sessionKey)
+        }
+
+        #expect(appModel.interactionSessions.availability == .stale)
+        #expect(recoveryKeys == ["chat-session", "talk-session"])
+        appModel.setTalkEnabled(false)
     }
 
     @Test @MainActor func `chat session key uses agent scoped key for non default agent`() {
@@ -1148,6 +1294,7 @@ private func overrideNotificationServingPreference(_ enabled: Bool) -> () -> Voi
         let watchService = MockWatchMessagingService()
         let talkMode = TalkModeManager(allowSimulatorCapture: true)
         let appModel = NodeAppModel(watchMessagingService: watchService, talkMode: talkMode)
+        appModel.interactionSessions.markUnsupported()
 
         watchService.emitAppCommand(
             WatchAppCommandEvent(
@@ -1178,6 +1325,63 @@ private func overrideNotificationServingPreference(_ enabled: Bool) -> () -> Voi
         #expect(watchService.lastSentAppSnapshot?.talkEnabled == false)
     }
 
+    @Test @MainActor func `watch start cannot retarget active talk to another session`() async {
+        let watchService = MockWatchMessagingService()
+        let talkMode = TalkModeManager(allowSimulatorCapture: true)
+        let appModel = NodeAppModel(watchMessagingService: watchService, talkMode: talkMode)
+        appModel.interactionSessions.markUnsupported()
+        appModel.setTalkEnabled(true, sessionKey: "session-a")
+
+        watchService.emitAppCommand(
+            WatchAppCommandEvent(
+                commandId: "watch-start-talk-b",
+                command: .startTalk,
+                sessionKey: "session-b",
+                gatewayStableID: nil,
+                text: nil,
+                sentAtMs: 125,
+                transport: "sendMessage"))
+        await Task.yield()
+
+        #expect(talkMode.isEnabled)
+        #expect(talkMode.interactionSessionKey == "session-a")
+        appModel.setTalkEnabled(false)
+    }
+
+    @Test @MainActor func `watch start rejects remote runtime takeover`() async {
+        let watchService = MockWatchMessagingService()
+        let talkMode = TalkModeManager(allowSimulatorCapture: true)
+        let appModel = NodeAppModel(watchMessagingService: watchService, talkMode: talkMode)
+        talkMode.enterScreenshotFixtureMode()
+        let generation = appModel.interactionSessions.beginSnapshot(for: "main")
+        appModel.interactionSessions.completeSnapshot(
+            InteractionSessionActiveProjection(
+                interactionsessionid: "interaction-remote",
+                sessionkey: "main",
+                epoch: 1,
+                runtimeid: "remote-relay",
+                runtimekind: .realtimeVoice,
+                state: "active"),
+            for: "main",
+            canonicalSessionKey: "main",
+            generation: generation)
+
+        watchService.emitAppCommand(
+            WatchAppCommandEvent(
+                commandId: "watch-reject-takeover",
+                command: .startTalk,
+                sessionKey: "main",
+                gatewayStableID: nil,
+                text: nil,
+                sentAtMs: 126,
+                transport: "sendMessage"))
+        await Task.yield()
+
+        #expect(!talkMode.isEnabled)
+        #expect(talkMode.statusText == "Active on another device")
+        #expect(watchService.lastSentAppSnapshot?.talkEnabled == false)
+    }
+
     @Test @MainActor func `watch app command opens chat session on phone model`() async {
         let watchService = MockWatchMessagingService()
         let appModel = NodeAppModel(watchMessagingService: watchService)
@@ -1201,6 +1405,7 @@ private func overrideNotificationServingPreference(_ enabled: Bool) -> () -> Voi
         let watchService = MockWatchMessagingService()
         let talkMode = TalkModeManager(allowSimulatorCapture: true)
         let appModel = NodeAppModel(watchMessagingService: watchService, talkMode: talkMode)
+        appModel.interactionSessions.markUnsupported()
         appModel._test_setConnectedGatewayID("gateway-current")
         appModel.setTalkEnabled(false)
 

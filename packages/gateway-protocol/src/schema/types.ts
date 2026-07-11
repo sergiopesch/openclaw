@@ -119,6 +119,14 @@ export type SessionsResetParams = SchemaType<"SessionsResetParams">;
 export type SessionsDeleteParams = SchemaType<"SessionsDeleteParams">;
 export type SessionsCompactParams = SchemaType<"SessionsCompactParams">;
 export type SessionsUsageParams = SchemaType<"SessionsUsageParams">;
+export type InteractionRuntimeKind = SchemaType<"InteractionRuntimeKind">;
+export type InteractionSessionActiveProjection = SchemaType<"InteractionSessionActiveProjection">;
+export type InteractionSessionReplacedProjection =
+  SchemaType<"InteractionSessionReplacedProjection">;
+export type InteractionSessionClosedProjection = SchemaType<"InteractionSessionClosedProjection">;
+export type InteractionSessionProjection = SchemaType<"InteractionSessionProjection">;
+export type InteractionSessionGetParams = SchemaType<"InteractionSessionGetParams">;
+export type InteractionSessionGetResult = SchemaType<"InteractionSessionGetResult">;
 
 /** Metadata-only audit query payloads. */
 export type AuditEvent = SchemaType<"AuditEvent">;

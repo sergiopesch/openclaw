@@ -249,6 +249,8 @@ final class NodeAppModel {
     private var forceOperatorTalkPermissionUpgradeRequest = false
     private var lastTalkPermissionReconnectAttemptAt: Date?
     private var voiceWakeSyncTask: Task<Void, Never>?
+    @ObservationIgnored private var interactionSessionSyncTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingPersistedTalkIntent = false
     @ObservationIgnored private var cameraHUDDismissTask: Task<Void, Never>?
     @ObservationIgnored private lazy var capabilityRouter: NodeCapabilityRouter = self.buildCapabilityRouter()
     private let gatewayHealthMonitor = GatewayHealthMonitor()
@@ -257,6 +259,7 @@ final class NodeAppModel {
     let voiceWake = VoiceWakeManager()
     let voiceNoteRecorder: OpenClawVoiceNoteRecorder
     let talkMode: TalkModeManager
+    let interactionSessions = InteractionSessionStore()
     private let locationService: any LocationServicing
     private let deviceStatusService: any DeviceStatusServicing
     private let photosService: any PhotosServicing
@@ -267,6 +270,7 @@ final class NodeAppModel {
     private let watchMessagingService: any WatchMessagingServicing
     #if DEBUG
     @ObservationIgnored private var testAgentRequestHandler: ((AgentDeepLink) async throws -> Void)?
+    @ObservationIgnored private var testInteractionSnapshotRequestHandler: ((String) -> Void)?
     #endif
     private var pttVoiceWakeLeaseCount = 0
     private var pttVoiceWakeWasSuspended = false
@@ -412,12 +416,21 @@ final class NodeAppModel {
               self.chatTranscriptCacheGatewayID == store.gatewayID,
               self.chatSessionRoutingContract == nil
         else { return }
-        self.selectedAgentId = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: store.gatewayID)
-        self.gatewaySessionScope = identity.scope
-        self.mainSessionBaseKey = identity.mainSessionKey
-        self.gatewayDefaultAgentId = identity.defaultAgentID
-        self.talkMode.updateMainSessionKey(self.mainSessionKey)
+        let selectedAgentID = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: store.gatewayID)
+        self.applyPersistedChatRoutingIdentity(identity, selectedAgentID: selectedAgentID)
         self.homeCanvasRevision &+= 1
+    }
+
+    private func applyPersistedChatRoutingIdentity(
+        _ identity: OpenClawChatSessionRoutingIdentity,
+        selectedAgentID: String?)
+    {
+        self.applyChatSessionTargetMutation {
+            self.selectedAgentId = selectedAgentID
+            self.gatewaySessionScope = identity.scope
+            self.mainSessionBaseKey = identity.mainSessionKey
+            self.gatewayDefaultAgentId = identity.defaultAgentID
+        }
     }
 
     func loadCachedChatSessions() async -> [OpenClawChatSessionEntry] {
@@ -524,6 +537,9 @@ final class NodeAppModel {
         self.watchMessagingService = watchMessagingService
         self.talkMode = talkMode
         self.voiceNoteRecorder = voiceNoteRecorder
+        self.talkMode.setInteractionRuntimeStateChangedHandler { [weak self] in
+            self?.reconcileTalkOwnership()
+        }
         self.voiceNoteRecorder.setCaptureAdmissionHandler { [weak self] in
             self?.isTalkCaptureActive == false
         }
@@ -596,8 +612,7 @@ final class NodeAppModel {
         self.talkMode.attachGateway(self.operatorGateway)
         refreshOperatorAdminScopeFromStore()
         refreshLastShareEventFromRelay()
-        let talkEnabled = UserDefaults.standard.bool(forKey: "talk.enabled")
-        self.setTalkEnabled(talkEnabled)
+        self.pendingPersistedTalkIntent = UserDefaults.standard.bool(forKey: "talk.enabled")
         self.locationService.setAuthorizationChangeHandler { [weak self] status in
             guard let self else { return }
             self.reconcileSignificantLocationMonitoring(
@@ -892,12 +907,57 @@ final class NodeAppModel {
         }
     }
 
-    func setTalkEnabled(_ enabled: Bool) {
+    func setTalkEnabled(
+        _ enabled: Bool,
+        sessionKey: String? = nil,
+        broadcastToGateway: Bool = true,
+        allowCanonicalTakeover: Bool = false)
+    {
+        self.pendingPersistedTalkIntent = false
         if self.isAppleReviewDemoModeEnabled {
             UserDefaults.standard.set(false, forKey: "talk.enabled")
             self.talkMode.setEnabled(false)
             self.talkMode.statusText = "Demo mode only"
             return
+        }
+        let requestedSessionKey = (sessionKey ?? self.chatSessionKey)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetSessionKey = requestedSessionKey.isEmpty ? self.chatSessionKey : requestedSessionKey
+        if enabled {
+            if self.talkMode.isEnabled {
+                // A running capture remains bound to its original session. Repeated starts
+                // cannot silently retarget that runtime through focus or Watch commands.
+                return
+            }
+            switch self.interactionSessions.availability {
+            case .disconnected, .syncing, .stale:
+                self.rejectTalkStart(statusText: "Checking active session")
+                return
+            case .current:
+                guard self.interactionSessions.isCurrent(for: targetSessionKey) else {
+                    self.rejectTalkStart(statusText: "Checking active session")
+                    return
+                }
+            case .unsupported:
+                break
+            }
+            self.talkMode.updateMainSessionKey(targetSessionKey)
+        }
+        let activeRuntime = self.interactionSessions.isCurrent(for: targetSessionKey)
+            ? self.interactionSessions.runtime(for: targetSessionKey)
+            : nil
+        let remoteRuntime = activeRuntime.flatMap { runtime in
+            runtime.state == .active && !self.isLocallyOwnedActiveInteractionRuntime(runtime)
+                ? runtime
+                : nil
+        }
+        if enabled, let remoteRuntime {
+            guard allowCanonicalTakeover,
+                  self.canTakeOverInteractionRuntime(remoteRuntime)
+            else {
+                self.rejectTalkStart(statusText: "Active on another device")
+                return
+            }
         }
         UserDefaults.standard.set(enabled, forKey: "talk.enabled")
         if enabled {
@@ -913,12 +973,51 @@ final class NodeAppModel {
             self.voiceWake.resumeAfterExternalAudioCapture(wasSuspended: self.talkVoiceWakeSuspended)
             self.talkVoiceWakeSuspended = false
         }
-        self.talkMode.setEnabled(enabled)
+        if enabled, remoteRuntime != nil {
+            self.talkMode.setEnabledForCanonicalTakeover { [weak self] in
+                self?.setTalkEnabled(
+                    false,
+                    sessionKey: targetSessionKey,
+                    broadcastToGateway: false)
+            }
+        } else {
+            self.talkMode.setEnabled(enabled)
+        }
+        // Canonical-capable gateways project ownership through interaction.session.changed.
+        // Broadcasting the legacy process-wide toggle would wake older clients in parallel.
+        guard broadcastToGateway, self.interactionSessions.availability == .unsupported else { return }
         Task { [weak self] in
             await self?.pushTalkModeToGateway(
                 enabled: enabled,
                 phase: enabled ? "enabled" : "disabled")
         }
+    }
+
+    private func rejectTalkStart(statusText: String) {
+        self.pendingPersistedTalkIntent = false
+        UserDefaults.standard.set(false, forKey: "talk.enabled")
+        self.talkMode.setEnabled(false)
+        self.voiceWake.setSuppressedByTalk(false)
+        self.voiceWake.resumeAfterExternalAudioCapture(wasSuspended: self.talkVoiceWakeSuspended)
+        self.talkVoiceWakeSuspended = false
+        self.talkMode.statusText = statusText
+    }
+
+    private func reconcilePersistedTalkIntentIfReady() {
+        guard self.pendingPersistedTalkIntent,
+              self.talkMode.gatewayTalkConfigLoaded
+        else { return }
+        let sessionKey = self.chatSessionKey
+        switch self.interactionSessions.availability {
+        case .current:
+            guard self.interactionSessions.isCurrent(for: sessionKey) else { return }
+        case .unsupported:
+            break
+        case .disconnected, .syncing, .stale:
+            return
+        }
+        self.pendingPersistedTalkIntent = false
+        self.setTalkEnabled(true, sessionKey: sessionKey)
     }
 
     func setTalkProviderSelection(_ rawValue: String) {
@@ -1078,9 +1177,10 @@ final class NodeAppModel {
             let scope = (session?["scope"] as? String) ?? "per-sender"
             guard shouldApply(), self.chatTranscriptCacheGatewayID == sourceGatewayID else { return }
             await MainActor.run {
-                self.mainSessionBaseKey = mainKey
-                self.gatewaySessionScope = scope
-                self.talkMode.updateMainSessionKey(self.mainSessionKey)
+                self.applyChatSessionTargetMutation {
+                    self.mainSessionBaseKey = mainKey
+                    self.gatewaySessionScope = scope
+                }
                 self.homeCanvasRevision &+= 1
             }
         } catch {
@@ -1113,17 +1213,11 @@ final class NodeAppModel {
                 defaultAgentID: decoded.defaultid)
             guard shouldApply(), self.chatTranscriptCacheGatewayID == sourceGatewayID else { return }
             await MainActor.run {
-                self.gatewayDefaultAgentId = decoded.defaultid
-                self.gatewayAgents = decoded.agents
-                self.gatewaySessionScope = decoded.scope.value as? String
-                self.applyMainSessionKey(decoded.mainkey)
-
-                let selected = (self.selectedAgentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !selected.isEmpty, !decoded.agents.contains(where: { $0.id == selected }) {
-                    self.selectedAgentId = nil
-                    self.focusedChatSessionKey = nil
-                }
-                self.talkMode.updateMainSessionKey(self.mainSessionKey)
+                self.applyGatewayAgentRoutingMetadata(
+                    defaultAgentID: decoded.defaultid,
+                    agents: decoded.agents,
+                    scope: decoded.scope.value as? String,
+                    mainSessionKey: decoded.mainkey)
                 self.homeCanvasRevision &+= 1
             }
             if let routingIdentity {
@@ -1131,6 +1225,27 @@ final class NodeAppModel {
             }
         } catch {
             // Best-effort only.
+        }
+    }
+
+    private func applyGatewayAgentRoutingMetadata(
+        defaultAgentID: String?,
+        agents: [AgentSummary],
+        scope: String?,
+        mainSessionKey: String?)
+    {
+        self.applyChatSessionTargetMutation {
+            self.gatewayDefaultAgentId = defaultAgentID
+            self.gatewayAgents = agents
+            self.gatewaySessionScope = scope
+            self.updateMainSessionBaseKey(mainSessionKey)
+
+            let selected = (self.selectedAgentId ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !selected.isEmpty, !agents.contains(where: { $0.id == selected }) {
+                self.selectedAgentId = nil
+                self.focusedChatSessionKey = nil
+            }
         }
     }
 
@@ -1152,16 +1267,15 @@ final class NodeAppModel {
         let currentSelectedAgentId = self.selectedAgentId?.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedAgentChanged = currentSelectedAgentId != nextSelectedAgentId
         let stableID = (connectedGatewayID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if stableID.isEmpty {
+        self.applyChatSessionTargetMutation {
             self.selectedAgentId = nextSelectedAgentId
-        } else {
-            self.selectedAgentId = nextSelectedAgentId
+            if selectedAgentChanged {
+                self.focusedChatSessionKey = nil
+            }
+        }
+        if !stableID.isEmpty {
             GatewaySettingsStore.saveGatewaySelectedAgentId(stableID: stableID, agentId: self.selectedAgentId)
         }
-        if selectedAgentChanged {
-            self.focusedChatSessionKey = nil
-        }
-        self.talkMode.updateMainSessionKey(mainSessionKey)
         self.homeCanvasRevision &+= 1
         if let relay = ShareGatewayRelaySettings.loadConfig() {
             ShareGatewayRelaySettings.saveConfig(
@@ -1218,6 +1332,170 @@ final class NodeAppModel {
         }
     }
 
+    private func startInteractionSessionSync(
+        shouldContinue: @escaping @MainActor @Sendable () -> Bool = { true }) async
+    {
+        self.interactionSessionSyncTask?.cancel()
+        self.interactionSessionSyncTask = nil
+        guard shouldContinue(),
+              let operatorRoute = await self.operatorGateway.currentRoute()
+        else {
+            self.interactionSessions.markDisconnected()
+            return
+        }
+
+        let supportsSnapshot = await self.operatorGateway.supportsServerMethod(
+            "interaction.session.get",
+            ifCurrentRoute: operatorRoute)
+        let supportsEvents = await self.operatorGateway.supportsServerEvent(
+            "interaction.session.changed",
+            ifCurrentRoute: operatorRoute)
+        guard supportsSnapshot == true, supportsEvents == true else {
+            if shouldContinue() {
+                self.interactionSessions.markUnsupported()
+            }
+            return
+        }
+
+        // Subscribe before requesting the baseline. The store buffers transitions until
+        // the snapshot lands, preventing a runtime change in this window from being lost.
+        let stream = await self.operatorGateway.subscribeServerEvents(
+            bufferingNewest: 32,
+            events: ["interaction.session.changed"])
+        self.interactionSessionSyncTask = Task { [weak self] in
+            guard let self else { return }
+            for await event in stream {
+                if Task.isCancelled || !shouldContinue() { return }
+                switch event.event {
+                case "interaction.session.changed":
+                    await self.handleInteractionSessionChangedPayload(event.payload) { sessionKey in
+                        await self.refreshInteractionSessionSnapshot(
+                            sessionKey: sessionKey,
+                            expectedRoute: operatorRoute,
+                            shouldContinue: shouldContinue)
+                    }
+                case "seqGap":
+                    await self.recoverStaleInteractionSessions { sessionKey in
+                        await self.refreshInteractionSessionSnapshot(
+                            sessionKey: sessionKey,
+                            expectedRoute: operatorRoute,
+                            shouldContinue: shouldContinue)
+                    }
+                default:
+                    continue
+                }
+            }
+        }
+        await self.refreshInteractionSessionSnapshot(
+            sessionKey: self.chatSessionKey,
+            expectedRoute: operatorRoute,
+            shouldContinue: shouldContinue)
+    }
+
+    private func handleInteractionSessionChangedPayload(
+        _ payload: AnyCodable?,
+        onDecodeFailure: @MainActor (String) async -> Void) async
+    {
+        guard let payload,
+              let projection = try? GatewayPayloadDecoding.decode(
+                  payload,
+                  as: InteractionSessionProjection.self)
+        else {
+            await self.recoverStaleInteractionSessions(onRefresh: onDecodeFailure)
+            return
+        }
+        self.applyInteractionSessionProjection(projection)
+    }
+
+    private func recoverStaleInteractionSessions(
+        onRefresh: @MainActor (String) async -> Void) async
+    {
+        let sessionKeys = self.interactionSessionRecoveryKeys()
+        self.interactionSessions.markStale()
+        for sessionKey in sessionKeys {
+            await onRefresh(sessionKey)
+        }
+    }
+
+    private func interactionSessionRecoveryKeys() -> [String] {
+        var sessionKeys: [String] = []
+        var candidates = [self.chatSessionKey]
+        if self.talkMode.isEnabled {
+            candidates.append(self.talkMode.interactionSessionKey)
+        }
+        for candidate in candidates {
+            let sessionKey = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sessionKey.isEmpty,
+                  !sessionKeys.contains(where: {
+                      self.interactionSessions.representsSameSession($0, sessionKey)
+                  })
+            else { continue }
+            sessionKeys.append(sessionKey)
+        }
+        return sessionKeys
+    }
+
+    private func refreshInteractionSessionSnapshot(
+        sessionKey: String,
+        expectedRoute: GatewayNodeSessionRoute,
+        snapshotGeneration: UInt64? = nil,
+        retriesRemaining: Int = 1,
+        shouldContinue: @escaping @MainActor @Sendable () -> Bool = { true }) async
+    {
+        guard shouldContinue() else { return }
+        let snapshotGeneration = snapshotGeneration
+            ?? self.interactionSessions.beginSnapshot(for: sessionKey)
+        do {
+            let params = InteractionSessionGetParams(sessionkey: sessionKey)
+            let paramsData = try JSONEncoder().encode(params)
+            guard let paramsJSON = String(data: paramsData, encoding: .utf8) else {
+                self.interactionSessions.failSnapshot(
+                    for: sessionKey,
+                    generation: snapshotGeneration)
+                return
+            }
+            let response = try await self.operatorGateway.request(
+                method: "interaction.session.get",
+                paramsJSON: paramsJSON,
+                timeoutSeconds: 10,
+                ifCurrentRoute: expectedRoute,
+                distinguishPreDispatchRouteChange: true)
+            guard shouldContinue(),
+                  await self.operatorGateway.currentRoute() == expectedRoute
+            else { return }
+            let result = try JSONDecoder().decode(InteractionSessionGetResult.self, from: response)
+            let snapshotApplied = self.interactionSessions.completeSnapshot(
+                result.projection,
+                for: sessionKey,
+                canonicalSessionKey: result.sessionkey,
+                generation: snapshotGeneration)
+            if snapshotApplied {
+                self.reconcileTalkOwnership()
+                self.reconcilePersistedTalkIntentIfReady()
+            }
+        } catch {
+            guard shouldContinue(),
+                  await self.operatorGateway.currentRoute() == expectedRoute
+            else { return }
+            self.interactionSessions.failSnapshot(
+                for: sessionKey,
+                generation: snapshotGeneration)
+            GatewayDiagnostics.log(
+                "interaction session snapshot failed error=\(error.localizedDescription)")
+            guard retriesRemaining > 0 else { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled,
+                  shouldContinue(),
+                  await self.operatorGateway.currentRoute() == expectedRoute
+            else { return }
+            await self.refreshInteractionSessionSnapshot(
+                sessionKey: sessionKey,
+                expectedRoute: expectedRoute,
+                retriesRemaining: retriesRemaining - 1,
+                shouldContinue: shouldContinue)
+        }
+    }
+
     private func handleOperatorGatewayServerEvent(
         _ evt: EventFrame,
         expectedOperatorRoute: GatewayNodeSessionRoute? = nil,
@@ -1236,6 +1514,13 @@ final class NodeAppModel {
                 var phase: String?
             }
             guard let decoded = try? GatewayPayloadDecoding.decode(payload, as: Payload.self) else { return }
+            switch self.interactionSessions.availability {
+            case .syncing, .current, .stale:
+                // Canonical interaction ownership supersedes the legacy process-wide toggle.
+                return
+            case .disconnected, .unsupported:
+                break
+            }
             self.applyTalkModeSync(enabled: decoded.enabled, phase: decoded.phase)
         case ExecApprovalNotificationBridge.requestedKind:
             guard let approvalId = Self.execApprovalEventID(from: payload) else { return }
@@ -1272,6 +1557,33 @@ final class NodeAppModel {
         _ = phase
         guard self.talkMode.isEnabled != enabled else { return }
         self.setTalkEnabled(enabled)
+    }
+
+    func applyInteractionSessionProjection(_ projection: InteractionSessionProjection) {
+        self.interactionSessions.recordEvent(projection)
+        self.reconcileTalkOwnership()
+    }
+
+    private func reconcileTalkOwnership() {
+        let sessionKey = self.talkMode.interactionSessionKey
+        guard self.talkMode.isEnabled,
+              self.interactionSessions.isCurrent(for: sessionKey),
+              let runtime = self.interactionSessions.runtime(for: sessionKey)
+        else { return }
+        let shouldStop = switch runtime.state {
+        case .active:
+            !self.isLocallyOwnedActiveInteractionRuntime(runtime)
+        case .replaced, .closed:
+            self.isExactLocalInteractionRuntime(runtime)
+        }
+        guard shouldStop else { return }
+
+        // Canonical ownership fences client-local capture too; otherwise native WebRTC can
+        // remain live beside a Gateway-owned runtime that this device cannot project.
+        self.setTalkEnabled(
+            false,
+            sessionKey: sessionKey,
+            broadcastToGateway: false)
     }
 
     private func pushTalkModeToGateway(enabled: Bool, phase: String?) async {
@@ -2372,6 +2684,72 @@ extension NodeAppModel {
         return self.defaultChatSessionKey
     }
 
+    func interactionActionState(
+        for sessionKey: String) -> OpenClawChatTalkControl.ActionState
+    {
+        // Stop is always available for local intent, even while canonical state is refreshing.
+        if self.talkMode.isEnabled {
+            return self.interactionSessions.representsSameSession(
+                sessionKey,
+                self.talkMode.interactionSessionKey)
+                ? .localActive
+                : .unavailable
+        }
+        switch self.interactionSessions.availability {
+        case .unsupported:
+            return self.talkMode.isGatewayConnected ? .idle : .unavailable
+        case .disconnected, .syncing, .stale:
+            return .unavailable
+        case .current:
+            break
+        }
+
+        guard self.interactionSessions.isCurrent(for: sessionKey) else {
+            return .unavailable
+        }
+        guard let runtime = self.interactionSessions.runtime(for: sessionKey),
+              runtime.state == .active
+        else {
+            return .idle
+        }
+        if self.isLocallyOwnedActiveInteractionRuntime(runtime) {
+            return .localActive
+        }
+        guard self.canTakeOverInteractionRuntime(runtime) else { return .unavailable }
+        return .remoteActive
+    }
+
+    private func isExactLocalInteractionRuntime(_ runtime: InteractionSessionStore.Runtime) -> Bool {
+        runtime.runtimeKind == .realtimeVoice
+            && runtime.runtimeID == self.talkMode.activeRealtimeRelayRuntimeID
+    }
+
+    private func isLocallyOwnedActiveInteractionRuntime(
+        _ runtime: InteractionSessionStore.Runtime) -> Bool
+    {
+        guard runtime.runtimeKind == .realtimeVoice else { return false }
+        if self.isExactLocalInteractionRuntime(runtime) {
+            return true
+        }
+        let isBoundSession = self.interactionSessions.representsSameSession(
+            runtime.sessionKey,
+            self.talkMode.interactionSessionKey)
+        guard isBoundSession else { return false }
+        if self.talkMode.activeRealtimeRelayRuntimeID == nil {
+            // Before create returns an ID, only its bound in-flight request is provisional.
+            return self.talkMode.isPendingRealtimeRelayCreation(
+                for: self.talkMode.interactionSessionKey)
+        }
+        // During explicit takeover the old canonical runtime can remain projected briefly
+        // after this device has a new relay ID. Ordinary starts never get this tolerance.
+        return self.talkMode.isCanonicalTakeoverInProgress
+    }
+
+    private func canTakeOverInteractionRuntime(_ runtime: InteractionSessionStore.Runtime) -> Bool {
+        runtime.runtimeKind == .realtimeVoice
+            && self.talkMode.canTakeOverCanonicalRealtimeInteraction
+    }
+
     var defaultChatSessionKey: String {
         // Keep chat aligned with the gateway's resolved main session key.
         // A hardcoded "ios" base creates synthetic placeholder sessions in the chat UI.
@@ -2433,8 +2811,49 @@ extension NodeAppModel {
 
     func focusChatSession(_ sessionKey: String?) {
         let trimmed = (sessionKey ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        self.focusedChatSessionKey = trimmed.isEmpty ? nil : trimmed
-        self.talkMode.updateMainSessionKey(self.chatSessionKey)
+        self.applyChatSessionTargetMutation {
+            self.focusedChatSessionKey = trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
+    private func applyChatSessionTargetMutation(_ mutation: () -> Void) {
+        let previousSessionKey = self.chatSessionKey
+        mutation()
+        let nextSessionKey = self.chatSessionKey
+        self.talkMode.updateMainSessionKey(nextSessionKey)
+        guard previousSessionKey != nextSessionKey else { return }
+        self.requestInteractionSessionSnapshotIfNeeded(for: nextSessionKey)
+    }
+
+    private func requestInteractionSessionSnapshotIfNeeded(for sessionKey: String) {
+        if self.interactionSessions.availability == .current,
+           self.interactionSessions.isCurrent(for: sessionKey)
+        {
+            return
+        }
+        switch self.interactionSessions.availability {
+        case .current, .syncing, .stale:
+            break
+        case .disconnected, .unsupported:
+            return
+        }
+        #if DEBUG
+        self.testInteractionSnapshotRequestHandler?(sessionKey)
+        #endif
+        let snapshotGeneration = self.interactionSessions.beginSnapshot(for: sessionKey)
+        Task { [weak self] in
+            guard let self else { return }
+            guard let route = await self.operatorGateway.currentRoute() else {
+                self.interactionSessions.failSnapshot(
+                    for: sessionKey,
+                    generation: snapshotGeneration)
+                return
+            }
+            await self.refreshInteractionSessionSnapshot(
+                sessionKey: sessionKey,
+                expectedRoute: route,
+                snapshotGeneration: snapshotGeneration)
+        }
     }
 
     var chatAgentId: String {
@@ -2816,12 +3235,14 @@ extension NodeAppModel {
         self.voiceWakeSyncTask?.cancel()
         self.voiceWakeSyncTask = nil
         LiveActivityManager.shared.endActivity(reason: "new_gateway_connect")
-        self.mainSessionBaseKey = "main"
-        self.gatewaySessionScope = nil
-        self.gatewayDefaultAgentId = nil
-        self.gatewayAgents = []
-        self.selectedAgentId = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: stableID)
-        self.focusedChatSessionKey = nil
+        self.applyChatSessionTargetMutation {
+            self.mainSessionBaseKey = "main"
+            self.gatewaySessionScope = nil
+            self.gatewayDefaultAgentId = nil
+            self.gatewayAgents = []
+            self.selectedAgentId = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: stableID)
+            self.focusedChatSessionKey = nil
+        }
         self.homeCanvasRevision &+= 1
         self.apnsLastRegisteredTokenHex = nil
         self.apnsLastRegisteredGatewayStableID = nil
@@ -3164,7 +3585,6 @@ extension NodeAppModel {
         self.setOperatorConnected(true)
         self.clearOperatorGatewayConnectionProblemIfCurrent()
         self.forceOperatorTalkPermissionUpgradeRequest = false
-        self.talkMode.updateGatewayConnected(true)
         GatewayDiagnostics.log(
             "operator gateway connected host=\(url.host ?? "?") scheme=\(url.scheme ?? "?")")
 
@@ -3173,8 +3593,13 @@ extension NodeAppModel {
             stableID: stableID)
         await flushPendingWatchExecApprovalResolutions(shouldContinue: shouldContinue)
         guard shouldContinue() else { return }
+        await self.startInteractionSessionSync(shouldContinue: shouldContinue)
+        guard shouldContinue() else { return }
         await self.talkMode.reloadConfig(shouldApply: shouldContinue)
         guard shouldContinue() else { return }
+        // Persisted Talk intent may capture only after canonical ownership is current or
+        // explicitly unsupported, otherwise reconnect can race an existing remote runtime.
+        self.talkMode.updateGatewayConnected(true)
         await self.talkMode.prefetchRealtimeSessionIfReady(
             reason: "operator_connected",
             shouldApply: shouldContinue)
@@ -3183,6 +3608,7 @@ extension NodeAppModel {
         guard shouldContinue() else { return }
         await self.refreshAgentsFromGateway(shouldApply: shouldContinue)
         guard shouldContinue() else { return }
+        self.reconcilePersistedTalkIntentIfReady()
         await refreshShareRouteFromGateway(shouldApply: shouldContinue)
         guard shouldContinue() else { return }
         await registerAPNsTokenIfNeeded(shouldContinue: shouldContinue)
@@ -3753,6 +4179,9 @@ extension NodeAppModel {
         self.operatorStatusText = connected ? "Connected" : "Offline"
         self.refreshOperatorAdminScopeFromStore()
         guard connected else {
+            self.interactionSessionSyncTask?.cancel()
+            self.interactionSessionSyncTask = nil
+            self.interactionSessions.markDisconnected()
             guard changed else { return }
             Task { [weak self] in
                 await self?.syncWatchAppSnapshot(reason: "operator_offline")
@@ -3865,6 +4294,7 @@ extension NodeAppModel {
         self.activeGatewayConnectConfig = nil
         self.gatewayConnected = true
         self.setOperatorConnected(true)
+        self.interactionSessions.markUnsupported()
         self.hasOperatorAdminScope = true
         self.mainSessionBaseKey = "main"
         self.gatewaySessionScope = "per-sender"
@@ -4837,8 +5267,9 @@ extension NodeAppModel {
             return
         case .startTalk:
             guard !self.isAppleReviewDemoModeEnabled else { break }
-            self.talkMode.updateMainSessionKey(event.sessionKey ?? self.chatSessionKey)
-            self.setTalkEnabled(true)
+            self.setTalkEnabled(
+                true,
+                sessionKey: event.sessionKey ?? self.chatSessionKey)
         case .stopTalk:
             self.setTalkEnabled(false)
         }
@@ -6908,13 +7339,18 @@ extension NodeAppModel {
         self.gatewayConnected
     }
 
-    private func applyMainSessionKey(_ key: String?) {
+    private func updateMainSessionBaseKey(_ key: String?) {
         let trimmed = (key ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let current = self.mainSessionBaseKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed == current { return }
         self.mainSessionBaseKey = trimmed
-        self.talkMode.updateMainSessionKey(self.mainSessionKey)
+    }
+
+    private func applyMainSessionKey(_ key: String?) {
+        self.applyChatSessionTargetMutation {
+            self.updateMainSessionBaseKey(key)
+        }
     }
 
     func approvePendingAgentDeepLinkPrompt() async {
@@ -7293,6 +7729,58 @@ extension NodeAppModel {
         shouldContinue: @escaping @MainActor @Sendable () -> Bool) async
     {
         await self.handleOperatorGatewayServerEvent(event, shouldContinue: shouldContinue)
+    }
+
+    func _test_handleInteractionSessionChangedPayload(
+        _ payload: AnyCodable?,
+        onDecodeFailure: @MainActor (String) async -> Void) async
+    {
+        await self.handleInteractionSessionChangedPayload(
+            payload,
+            onDecodeFailure: onDecodeFailure)
+    }
+
+    func _test_recoverStaleInteractionSessions(
+        onRefresh: @MainActor (String) async -> Void) async
+    {
+        await self.recoverStaleInteractionSessions(onRefresh: onRefresh)
+    }
+
+    func _test_setInteractionSnapshotRequestHandler(_ handler: @escaping (String) -> Void) {
+        self.testInteractionSnapshotRequestHandler = handler
+    }
+
+    func _test_applyPersistedChatRoutingIdentity(
+        mainSessionKey: String,
+        defaultAgentID: String?,
+        selectedAgentID: String?)
+    {
+        guard let identity = OpenClawChatSessionRoutingIdentity(
+            scope: "per-sender",
+            mainSessionKey: mainSessionKey,
+            defaultAgentID: defaultAgentID)
+        else { return }
+        self.applyPersistedChatRoutingIdentity(identity, selectedAgentID: selectedAgentID)
+    }
+
+    func _test_applyGatewayAgentRoutingMetadata(
+        mainSessionKey: String,
+        defaultAgentID: String?,
+        agents: [AgentSummary])
+    {
+        self.applyGatewayAgentRoutingMetadata(
+            defaultAgentID: defaultAgentID,
+            agents: agents,
+            scope: "per-sender",
+            mainSessionKey: mainSessionKey)
+    }
+
+    func _test_applyMainSessionKey(_ key: String) {
+        self.applyMainSessionKey(key)
+    }
+
+    func _test_reconcilePersistedTalkIntentIfReady() {
+        self.reconcilePersistedTalkIntentIfReady()
     }
 
     nonisolated static func _test_watchExecApprovalIDsNeedingFetch(

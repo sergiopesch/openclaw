@@ -7,34 +7,6 @@ import PhotosUI
 import UniformTypeIdentifiers
 #endif
 
-public struct OpenClawChatTalkControl {
-    public var isEnabled: Bool
-    public var isListening: Bool
-    public var isSpeaking: Bool
-    public var isGatewayConnected: Bool
-    public var statusText: String
-    public var providerLabel: String
-    public var toggle: @MainActor (_ sessionKey: String) -> Void
-
-    public init(
-        isEnabled: Bool,
-        isListening: Bool,
-        isSpeaking: Bool,
-        isGatewayConnected: Bool,
-        statusText: String,
-        providerLabel: String,
-        toggle: @escaping @MainActor (_ sessionKey: String) -> Void)
-    {
-        self.isEnabled = isEnabled
-        self.isListening = isListening
-        self.isSpeaking = isSpeaking
-        self.isGatewayConnected = isGatewayConnected
-        self.statusText = statusText
-        self.providerLabel = providerLabel
-        self.toggle = toggle
-    }
-}
-
 private struct CleanChatComposerSurface: ViewModifier {
     let cornerRadius: CGFloat
 
@@ -61,6 +33,18 @@ private struct CleanChatComposerSurface: ViewModifier {
                         .strokeBorder(OpenClawChatTheme.composerBorder, lineWidth: 1))
         }
         #endif
+    }
+}
+
+private struct CompactAttachmentLabel: View {
+    let controlHeight: CGFloat
+
+    var body: some View {
+        Image(systemName: "paperclip")
+            .font(OpenClawChatTypography.display(size: 15, weight: .semibold, relativeTo: .subheadline))
+            .foregroundStyle(.secondary)
+            .frame(width: self.controlHeight, height: self.controlHeight)
+            .contentShape(Rectangle())
     }
 }
 
@@ -356,12 +340,13 @@ struct OpenClawChatComposer: View {
 
     @ViewBuilder
     private var attachmentPicker: some View {
+        let compactControlHeight = self.cleanControlHeight
         #if os(macOS)
         if self.composerChrome == .clean {
             Button {
                 self.pickFilesMac()
             } label: {
-                self.compactAttachmentLabel
+                CompactAttachmentLabel(controlHeight: compactControlHeight)
             }
             .help("Add Image")
             .accessibilityLabel("Attachments")
@@ -384,7 +369,7 @@ struct OpenClawChatComposer: View {
         #else
         if self.composerChrome == .clean {
             PhotosPicker(selection: self.$pickerItems, maxSelectionCount: 8, matching: .images) {
-                self.compactAttachmentLabel
+                CompactAttachmentLabel(controlHeight: compactControlHeight)
             }
             .help("Add Image")
             .accessibilityLabel("Attachments")
@@ -409,14 +394,6 @@ struct OpenClawChatComposer: View {
             }
         }
         #endif
-    }
-
-    private var compactAttachmentLabel: some View {
-        Image(systemName: "paperclip")
-            .font(OpenClawChatTypography.display(size: 15, weight: .semibold, relativeTo: .subheadline))
-            .foregroundStyle(.secondary)
-            .frame(width: self.cleanControlHeight, height: self.cleanControlHeight)
-            .contentShape(Rectangle())
     }
 
     private var attachmentsStrip: some View {
@@ -582,17 +559,18 @@ struct OpenClawChatComposer: View {
     }
 
     private func talkButton(_ talkControl: OpenClawChatTalkControl) -> some View {
-        Button {
-            talkControl.toggle(self.viewModel.sessionKey)
+        let presentation = talkControl.actionState.presentation
+        return Button {
+            talkControl.performAction(self.viewModel.sessionKey)
         } label: {
             HStack(spacing: 6) {
-                Image(systemName: talkControl.isEnabled ? "stop.fill" : "waveform")
+                Image(systemName: presentation.systemImage)
                     .font(OpenClawChatTypography.captionSemiBold)
-                Text(talkControl.isEnabled ? "Stop" : "Talk")
+                Text(presentation.title)
                     .font(OpenClawChatTypography.captionSemiBold)
                     .lineLimit(1)
             }
-            .foregroundStyle(talkControl.isEnabled ? .white : .primary)
+            .foregroundStyle(presentation.isProminent ? .white : .primary)
             .padding(.horizontal, 10)
             .frame(height: 32)
             .background {
@@ -605,53 +583,57 @@ struct OpenClawChatComposer: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(!talkControl.isGatewayConnected && !talkControl.isEnabled)
-        .accessibilityLabel(talkControl.isEnabled ? "Stop realtime chat" : "Start realtime chat")
+        .disabled(!presentation.isEnabled)
+        .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityValue(self.talkAccessibilityValue(talkControl))
         .accessibilityIdentifier("chat-realtime-control")
         .help(self.talkHelpText(talkControl))
     }
 
     private func compactTalkButton(_ talkControl: OpenClawChatTalkControl) -> some View {
-        Button {
-            talkControl.toggle(self.viewModel.sessionKey)
+        let presentation = talkControl.actionState.presentation
+        let iconColor: Color = talkControl.actionState == .unavailable ? .primary : .white
+        return Button {
+            talkControl.performAction(self.viewModel.sessionKey)
         } label: {
-            Image(systemName: talkControl.isEnabled ? "stop.fill" : "waveform")
+            Image(systemName: presentation.systemImage)
                 .font(OpenClawChatTypography.body(size: 14, weight: .semibold, relativeTo: .subheadline))
-                .foregroundStyle(.white)
+                .foregroundStyle(iconColor)
                 .frame(width: self.cleanIconControlSize, height: self.cleanIconControlSize)
                 // Prominent filled circle so the mic reads as the primary action,
                 // mirroring the send button it swaps with once a draft exists.
                 .background {
                     Circle()
-                        .fill(talkControl.isEnabled
-                            ? self.talkButtonFill(talkControl)
-                            : AnyShapeStyle(OpenClawChatTheme.accent))
-                        .opacity(talkControl.isGatewayConnected || talkControl.isEnabled ? 1 : 0.4)
+                        .fill(talkControl.actionState == .idle
+                            ? AnyShapeStyle(OpenClawChatTheme.accent)
+                            : self.talkButtonFill(talkControl))
                 }
                 .frame(width: self.cleanControlHeight, height: self.cleanControlHeight)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!talkControl.isGatewayConnected && !talkControl.isEnabled)
-        .accessibilityLabel(talkControl.isEnabled ? "Stop realtime chat" : "Start realtime chat")
+        .disabled(!presentation.isEnabled)
+        .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityValue(self.talkAccessibilityValue(talkControl))
         .accessibilityIdentifier("chat-realtime-control")
         .help(self.talkHelpText(talkControl))
     }
 
     private func talkButtonFill(_ talkControl: OpenClawChatTalkControl) -> AnyShapeStyle {
-        if talkControl.isEnabled {
-            return AnyShapeStyle(OpenClawChatTheme.userBubble)
+        switch talkControl.actionState {
+        case .localActive:
+            AnyShapeStyle(OpenClawChatTheme.userBubble)
+        case .remoteActive:
+            AnyShapeStyle(OpenClawChatTheme.accent)
+        case .unavailable:
+            AnyShapeStyle(Color.secondary.opacity(0.12))
+        case .idle:
+            OpenClawChatTheme.subtleCard
         }
-        if !talkControl.isGatewayConnected {
-            return AnyShapeStyle(Color.secondary.opacity(0.12))
-        }
-        return OpenClawChatTheme.subtleCard
     }
 
     private func talkButtonStroke(_ talkControl: OpenClawChatTalkControl) -> Color {
-        if talkControl.isEnabled {
+        if talkControl.actionState.presentation.isProminent {
             return Color.white.opacity(0.18)
         }
         return OpenClawChatTheme.composerBorder
@@ -664,11 +646,7 @@ struct OpenClawChatComposer: View {
     }
 
     private func talkHelpText(_ talkControl: OpenClawChatTalkControl) -> String {
-        if !talkControl.isGatewayConnected, !talkControl.isEnabled {
-            return "Connect the gateway before starting realtime chat"
-        }
-        let action = talkControl.isEnabled ? "Stop" : "Start"
-        return "\(action) realtime chat for \(self.activeSessionLabel)"
+        "\(talkControl.actionState.presentation.helpAction) \(self.activeSessionLabel)"
     }
 
     private var connectionPill: some View {

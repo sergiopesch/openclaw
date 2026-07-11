@@ -22,6 +22,7 @@
     "update.available": "Gateway self-update notices do not apply to iOS; app updates ship via the App Store."
   },
   "android": {
+    "interaction.session.changed": "Interaction runtime ownership is not surfaced by the Android app yet.",
     "session.operation": "Chat UI derives run state from chat/agent events; no session.operation consumer yet.",
     "session.tool": "Session tool stream is not rendered by the Android chat surface yet.",
     "task.suggestion": "Task suggestion cards are a Control UI-only surface; Android does not render them.",

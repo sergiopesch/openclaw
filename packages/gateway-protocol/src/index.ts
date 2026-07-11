@@ -447,6 +447,20 @@ import {
   SessionsSendParamsSchema,
   type SessionsUsageParams,
   SessionsUsageParamsSchema,
+  type InteractionRuntimeKind,
+  InteractionRuntimeKindSchema,
+  type InteractionSessionActiveProjection,
+  InteractionSessionActiveProjectionSchema,
+  type InteractionSessionClosedProjection,
+  InteractionSessionClosedProjectionSchema,
+  type InteractionSessionGetParams,
+  InteractionSessionGetParamsSchema,
+  type InteractionSessionGetResult,
+  InteractionSessionGetResultSchema,
+  type InteractionSessionProjection,
+  InteractionSessionProjectionSchema,
+  type InteractionSessionReplacedProjection,
+  InteractionSessionReplacedProjectionSchema,
   type TaskSuggestion,
   type TaskSuggestionEvent,
   TaskSuggestionEventSchema,
@@ -854,6 +868,15 @@ export const validateSessionsCompactionRestoreParams = lazyCompile<SessionsCompa
 );
 export const validateSessionsUsageParams =
   lazyCompile<SessionsUsageParams>(SessionsUsageParamsSchema);
+export const validateInteractionSessionProjection = lazyCompile<InteractionSessionProjection>(
+  InteractionSessionProjectionSchema,
+);
+export const validateInteractionSessionGetParams = lazyCompile<InteractionSessionGetParams>(
+  InteractionSessionGetParamsSchema,
+);
+export const validateInteractionSessionGetResult = lazyCompile<InteractionSessionGetResult>(
+  InteractionSessionGetResultSchema,
+);
 export const validateTaskSuggestionsListParams = lazyCompile<TaskSuggestionsListParams>(
   TaskSuggestionsListParamsSchema,
 );
@@ -1269,6 +1292,13 @@ export {
   SessionsDeleteParamsSchema,
   SessionsCompactParamsSchema,
   SessionsUsageParamsSchema,
+  InteractionRuntimeKindSchema,
+  InteractionSessionActiveProjectionSchema,
+  InteractionSessionReplacedProjectionSchema,
+  InteractionSessionClosedProjectionSchema,
+  InteractionSessionProjectionSchema,
+  InteractionSessionGetParamsSchema,
+  InteractionSessionGetResultSchema,
   ArtifactSummarySchema,
   ArtifactsListParamsSchema,
   ArtifactsGetParamsSchema,
@@ -1673,6 +1703,13 @@ export type {
   SessionsDeleteParams,
   SessionsCompactParams,
   SessionsUsageParams,
+  InteractionRuntimeKind,
+  InteractionSessionActiveProjection,
+  InteractionSessionReplacedProjection,
+  InteractionSessionClosedProjection,
+  InteractionSessionProjection,
+  InteractionSessionGetParams,
+  InteractionSessionGetResult,
   AuditEvent,
   AuditListParams,
   AuditListResult,
