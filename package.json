@@ -177,14 +177,14 @@
     "discord-api-types": "^0.38.38",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
-    "file-type": "^21.3.0",
+    "file-type": "^21.3.2",
     "grammy": "^1.39.3",
     "jiti": "^2.6.1",
     "json5": "^2.2.3",
     "jszip": "^3.10.1",
     "linkedom": "^0.18.12",
     "long": "^5.3.2",
-    "markdown-it": "^14.1.0",
+    "markdown-it": "^14.3.3",
     "node-edge-tts": "^1.2.9",
     "osc-progress": "^0.3.0",
     "pdfjs-dist": "^5.4.530",
@@ -194,12 +194,12 @@
     "sharp": "^0.34.5",
     "signal-utils": "^0.21.1",
     "sqlite-vec": "0.1.7-alpha.2",
-    "tar": "7.5.7",
+    "tar": "7.5.21",
     "tslog": "^4.10.2",
-    "undici": "^7.19.2",
-    "ws": "^8.19.0",
+    "undici": "^7.30.1",
+    "ws": "^8.21.1",
     "yaml": "^2.8.2",
-    "zod": "^4.3.6"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@grammyjs/types": "^3.23.0",
@@ -228,7 +228,7 @@
     "node-llama-cpp": "3.15.1"
   },
   "overrides": {
-    "tar": "7.5.7"
+    "tar": "7.5.21"
   },
   "engines": {
     "node": ">=22.12.0"
@@ -238,7 +238,7 @@
     "minimumReleaseAge": 2880,
     "overrides": {
       "@sinclair/typebox": "0.34.47",
-      "tar": "7.5.7"
+      "tar": "7.5.21"
     }
   },
   "vitest": {

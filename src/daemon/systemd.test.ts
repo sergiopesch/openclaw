@@ -29,6 +29,13 @@ describe("systemd runtime parsing", () => {
 });
 
 describe("resolveSystemdUserUnitPath", () => {
+  it("uses POSIX separators for Windows home directories", () => {
+    const env = { HOME: "C:\\Users\\test" };
+    expect(resolveSystemdUserUnitPath(env)).toBe(
+      "C:/Users/test/.config/systemd/user/openclaw-gateway.service",
+    );
+  });
+
   it("uses default service name when OPENCLAW_PROFILE is default", () => {
     const env = { HOME: "/home/test", OPENCLAW_PROFILE: "default" };
     expect(resolveSystemdUserUnitPath(env)).toBe(
@@ -134,7 +141,16 @@ describe("systemd unit discovery", () => {
     expect(match?.name).toBe("openclaw-gateway");
 
     const command = await readSystemdServiceExecStart(env);
-    expect(command?.sourcePath).toBe(path.join(userDir, "openclaw-gateway.service"));
+    expect(command?.sourcePath).toBe(
+      path.posix.join(userDir.replace(/\\/g, "/"), "openclaw-gateway.service"),
+    );
+    expect(command?.programArguments).toEqual([
+      "/usr/bin/node",
+      "/opt/openclaw",
+      "gateway",
+      "--port",
+      "18789",
+    ]);
     expect(command?.environment?.OPENCLAW_STATE_DIR).toBe(stateDir);
   });
 });

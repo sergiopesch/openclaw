@@ -17,7 +17,7 @@ import {
 } from "../infra/shell-env.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { logInfo } from "../logger.js";
-import { markBackgrounded, tail } from "./bash-process-registry.js";
+import { markBackgrounded } from "./bash-process-registry.js";
 import {
   buildSandboxEnv,
   clampNumber,

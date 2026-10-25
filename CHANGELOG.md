@@ -8,6 +8,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- CI: run fork validation on hosted runners and recognize current branded installer versions. (#1) Thanks @sergiopesch.
 - Telegram: restore draft streaming partials. (#5543) Thanks @obviyus.
 - fix(lobster): block arbitrary exec via lobsterPath/cwd injection (GHSA-4mhr-g7xj-cg8j). (#5335) Thanks @vignesh07.
 

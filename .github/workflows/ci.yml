@@ -6,7 +6,7 @@ on:
 
 jobs:
   install-check:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
           pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
   checks:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -156,11 +156,15 @@ jobs:
           pnpm -v
           pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
+      - name: Build package and plugin SDK for tests
+        if: matrix.task == 'test'
+        run: pnpm build
+
       - name: Run ${{ matrix.task }} (${{ matrix.runtime }})
         run: ${{ matrix.command }}
 
   secrets:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -185,7 +189,7 @@ jobs:
           fi
 
   checks-windows:
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     env:
       NODE_OPTIONS: --max-old-space-size=4096
       CLAWDBOT_TEST_WORKERS: 1
@@ -269,6 +273,10 @@ jobs:
           pnpm -v
           pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
+      - name: Build package and plugin SDK for tests
+        if: matrix.task == 'test'
+        run: pnpm build
+
       - name: Run ${{ matrix.task }} (${{ matrix.runtime }})
         run: ${{ matrix.command }}
 
@@ -338,6 +346,10 @@ jobs:
           node -v
           pnpm -v
           pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+
+      - name: Build package and plugin SDK for tests
+        if: matrix.task == 'test'
+        run: pnpm build
 
       - name: Run ${{ matrix.task }}
         env:
@@ -587,7 +599,7 @@ jobs:
           PY
 
   android:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -625,6 +637,7 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           accept-android-sdk-licenses: false
+          packages: platform-tools
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
