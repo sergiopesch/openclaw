@@ -13,6 +13,9 @@ jobs:
       - name: Checkout CLI
         uses: actions/checkout@v4
 
+      - name: Verify installer version checks
+        run: bash scripts/docker/install-sh-smoke/run.test.sh
+
       - name: Setup pnpm (corepack retry)
         run: |
           set -euo pipefail

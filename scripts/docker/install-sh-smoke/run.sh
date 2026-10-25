@@ -59,8 +59,26 @@ fi
 if [[ -n "${OPENCLAW_INSTALL_LATEST_OUT:-}" ]]; then
   printf "%s" "$LATEST_VERSION" > "${OPENCLAW_INSTALL_LATEST_OUT:-}"
 fi
-INSTALLED_VERSION="$("$CLI_NAME" --version 2>/dev/null | head -n 1 | tr -d '\r')"
-echo "cli=$CLI_NAME installed=$INSTALLED_VERSION expected=$LATEST_VERSION"
+RAW_INSTALLED_VERSION="$("$CLI_NAME" --version 2>/dev/null | head -n 1 | tr -d '\r')"
+
+# Older CLIs print a bare version; current releases include the brand and git SHA.
+normalize_cli_version() {
+  local output="$1"
+  local version_pattern='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?'
+  local bare_pattern="^(${version_pattern})$"
+  local branded_pattern="^OpenClaw[[:space:]]+(${version_pattern})([[:space:]]+\\([[:xdigit:]]{7,40}\\))?$"
+  if [[ "$output" =~ $bare_pattern || "$output" =~ $branded_pattern ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+if ! INSTALLED_VERSION="$(normalize_cli_version "$RAW_INSTALLED_VERSION")"; then
+  echo "ERROR: unsupported ${CLI_NAME} version output: ${RAW_INSTALLED_VERSION}" >&2
+  exit 1
+fi
+echo "cli=$CLI_NAME installed=$INSTALLED_VERSION output=$RAW_INSTALLED_VERSION expected=$LATEST_VERSION"
 
 if [[ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]]; then
   echo "ERROR: expected ${CLI_NAME}@${LATEST_VERSION}, got ${CLI_NAME}@${INSTALLED_VERSION}" >&2
